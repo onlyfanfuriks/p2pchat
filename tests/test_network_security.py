@@ -81,6 +81,7 @@ async def _handshaked_pair(
     alice = PeerSession(ar, aw, alice_acc, alice_store, is_initiator=True, verify_callback=accept)
     bob = PeerSession(br, bw, bob_acc, bob_store, is_initiator=False, verify_callback=accept)
     await asyncio.gather(alice.handshake(), bob.handshake())
+    await asyncio.gather(alice.verify_and_activate(), bob.verify_and_activate())
     return alice, bob, alice_acc, bob_acc
 
 

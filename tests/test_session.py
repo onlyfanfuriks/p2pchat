@@ -22,6 +22,12 @@ from p2pchat.core.protocol import WireMessage, write_message
 from p2pchat.core.storage import Contact, Storage, derive_db_key
 
 
+async def _full_handshake(session: PeerSession) -> None:
+    """Perform crypto handshake + identity verification in one step."""
+    await session.handshake()
+    await session.verify_and_activate()
+
+
 # ---------------------------------------------------------------------------
 # Account / Storage factories
 # ---------------------------------------------------------------------------
@@ -103,7 +109,7 @@ class TestHandshake:
         alice_session = PeerSession(ar, aw, alice_acc, alice_store, is_initiator=True)
         bob_session = PeerSession(br, bw, bob_acc, bob_store, is_initiator=False)
 
-        await asyncio.gather(*[alice_session.handshake(), bob_session.handshake()])
+        await asyncio.gather(*[_full_handshake(alice_session), _full_handshake(bob_session)])
 
         assert alice_session.state == "active"
         assert bob_session.state == "active"
@@ -133,7 +139,7 @@ class TestHandshake:
             verify_callback=accept_all,
         )
 
-        await asyncio.gather(*[alice_session.handshake(), bob_session.handshake()])
+        await asyncio.gather(*[_full_handshake(alice_session), _full_handshake(bob_session)])
 
         assert alice_session.state == "active"
         assert bob_session.state == "active"
@@ -165,7 +171,7 @@ class TestHandshake:
         )
 
         results = await asyncio.gather(
-            *[alice_session.handshake(), bob_session.handshake()],
+            *[_full_handshake(alice_session), _full_handshake(bob_session)],
             return_exceptions=True,
         )
 
@@ -193,7 +199,7 @@ class TestHandshake:
             verify_callback=accept_all,
         )
 
-        await asyncio.gather(*[alice_session.handshake(), bob_session.handshake()])
+        await asyncio.gather(*[_full_handshake(alice_session), _full_handshake(bob_session)])
 
         # Access private session key for verification.
         assert alice_session._session_key is not None
@@ -231,7 +237,7 @@ class TestMessageExchange:
             br, bw, bob_acc, bob_store, is_initiator=False, verify_callback=cb
         )
 
-        await asyncio.gather(*[alice_session.handshake(), bob_session.handshake()])
+        await asyncio.gather(*[_full_handshake(alice_session), _full_handshake(bob_session)])
         return alice_session, bob_session
 
     async def test_send_receive_roundtrip(self, tmp_path: Path):
@@ -322,7 +328,7 @@ class TestMessageExchange:
             br, bw, bob_acc, bob_store, is_initiator=False, verify_callback=accept
         )
 
-        await asyncio.gather(*[alice_session.handshake(), bob_session.handshake()])
+        await asyncio.gather(*[_full_handshake(alice_session), _full_handshake(bob_session)])
 
         # Build a tampered chat message with invalid ciphertext and a bad signature.
         tampered_payload = {
@@ -377,7 +383,7 @@ class TestMessageExchange:
             br, bw, bob_acc, bob_store, is_initiator=False, verify_callback=accept
         )
 
-        await asyncio.gather(*[alice_session.handshake(), bob_session.handshake()])
+        await asyncio.gather(*[_full_handshake(alice_session), _full_handshake(bob_session)])
 
         # Use the correct session key but sign with evil_acc's identity key.
         session_key = alice_session._session_key
@@ -468,7 +474,7 @@ class TestSessionState:
         (ar, aw), (br, bw) = await make_stream_pair()
         alice = PeerSession(ar, aw, alice_acc, alice_store, is_initiator=True, verify_callback=accept)
         bob = PeerSession(br, bw, bob_acc, bob_store, is_initiator=False, verify_callback=accept)
-        await asyncio.gather(*[alice.handshake(), bob.handshake()])
+        await asyncio.gather(*[_full_handshake(alice), _full_handshake(bob)])
 
         await alice.close()
         await alice.close()  # Should not raise.
@@ -486,7 +492,7 @@ class TestSessionState:
         (ar, aw), (br, bw) = await make_stream_pair()
         alice = PeerSession(ar, aw, alice_acc, alice_store, is_initiator=True, verify_callback=accept)
         bob = PeerSession(br, bw, bob_acc, bob_store, is_initiator=False, verify_callback=accept)
-        await asyncio.gather(*[alice.handshake(), bob.handshake()])
+        await asyncio.gather(*[_full_handshake(alice), _full_handshake(bob)])
 
         assert alice._session_key is not None
         await alice.close()
@@ -509,7 +515,7 @@ class TestControlMessages:
         (ar, aw), (br, bw) = await make_stream_pair()
         alice = PeerSession(ar, aw, alice_acc, alice_store, is_initiator=True, verify_callback=accept)
         bob = PeerSession(br, bw, bob_acc, bob_store, is_initiator=False, verify_callback=accept)
-        await asyncio.gather(*[alice.handshake(), bob.handshake()])
+        await asyncio.gather(*[_full_handshake(alice), _full_handshake(bob)])
         return alice, bob
 
     async def test_bye_terminates_receive_loop(self, tmp_path: Path):
@@ -589,7 +595,7 @@ class TestControlMessages:
         (ar, aw), (br, bw) = await make_stream_pair()
         alice = PeerSession(ar, aw, alice_acc, alice_store, is_initiator=True, verify_callback=accept)
         bob = PeerSession(br, bw, bob_acc, bob_store, is_initiator=False, verify_callback=accept)
-        await asyncio.gather(*[alice.handshake(), bob.handshake()])
+        await asyncio.gather(*[_full_handshake(alice), _full_handshake(bob)])
 
         # Send a message with a spoofed from_id.
         spoofed = WireMessage(
@@ -672,7 +678,7 @@ class TestDisplayNameChange:
         alice = PeerSession(ar, aw, alice_acc, alice_store, is_initiator=True)
         bob = PeerSession(br, bw, bob_acc, bob_store, is_initiator=False)
 
-        await asyncio.gather(*[alice.handshake(), bob.handshake()])
+        await asyncio.gather(*[_full_handshake(alice), _full_handshake(bob)])
 
         assert alice.state == "active"
         assert bob.state == "active"
@@ -701,7 +707,7 @@ class TestVerifyCallbackEdgeCases:
         bob = PeerSession(br, bw, bob_acc, bob_store, is_initiator=False, verify_callback=accept_cb)
 
         results = await asyncio.gather(
-            *[alice.handshake(), bob.handshake()],
+            *[_full_handshake(alice), _full_handshake(bob)],
             return_exceptions=True,
         )
 
@@ -720,7 +726,7 @@ class TestVerifyCallbackEdgeCases:
         bob = PeerSession(br, bw, bob_acc, bob_store, is_initiator=False)
 
         results = await asyncio.gather(
-            *[alice.handshake(), bob.handshake()],
+            *[_full_handshake(alice), _full_handshake(bob)],
             return_exceptions=True,
         )
 

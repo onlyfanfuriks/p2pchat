@@ -122,7 +122,7 @@ async def connect(
         verify_callback=verify_callback,
     )
 
-    # N-21: Use remaining time budget for the handshake.
+    # N-21: Use remaining time budget for the crypto handshake.
     remaining = max(0.1, deadline - loop.time())
 
     try:
@@ -133,6 +133,14 @@ async def connect(
             f"Application-layer handshake with {ygg_address}:{port} "
             f"timed out (budget exhausted)"
         ) from None
+    except Exception:
+        await session.close()
+        raise
+
+    # Identity verification is interactive (user may need to approve) —
+    # no timeout so the user has time to verify the fingerprint.
+    try:
+        await session.verify_and_activate()
     except Exception:
         await session.close()
         raise

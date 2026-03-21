@@ -277,7 +277,7 @@ class ChatServer:
             verify_callback=self._verify_callback,
         )
 
-        # N-02: Server-side handshake timeout.
+        # N-02: Server-side crypto handshake timeout.
         try:
             await asyncio.wait_for(session.handshake(), timeout=_HANDSHAKE_TIMEOUT)
         except asyncio.TimeoutError:
@@ -288,6 +288,19 @@ class ChatServer:
             except Exception:
                 pass
             return
+        except Exception as exc:
+            log.warning("Handshake failed with %s: %s", peer_addr, exc)
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return
+
+        # Identity verification is interactive (user approves via modal) —
+        # no timeout so the user has time to verify the fingerprint.
+        try:
+            await session.verify_and_activate()
         except ConnectionRefusedError as exc:
             log.info("Rejected peer %s: %s", peer_addr, exc)
             try:
@@ -297,7 +310,7 @@ class ChatServer:
                 pass
             return
         except Exception as exc:
-            log.warning("Handshake failed with %s: %s", peer_addr, exc)
+            log.warning("Verification failed with %s: %s", peer_addr, exc)
             try:
                 writer.close()
                 await writer.wait_closed()

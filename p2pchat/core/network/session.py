@@ -301,12 +301,24 @@ class PeerSession:
                 f"handshake identity {self._peer_id!r}"
             )
 
-        # --- Identity verification (TOFU) ---
-        await self._verify_peer_identity()
+        self._state = "handshake_done"
+        log.info(
+            "Crypto handshake complete with peer %s (%s)",
+            self._peer_id,
+            self._peer_display_name,
+        )
 
+    async def verify_and_activate(self) -> None:
+        """Verify peer identity (TOFU) and activate the session.
+
+        This is separated from handshake() because identity verification
+        may require interactive user input (verify modal) which should
+        not be subject to the handshake timeout.
+        """
+        await self._verify_peer_identity()
         self._state = "active"
         log.info(
-            "Handshake complete with peer %s (%s)",
+            "Session activated with peer %s (%s)",
             self._peer_id,
             self._peer_display_name,
         )
