@@ -120,7 +120,7 @@ class YggdrasilNode:
         RuntimeError
             If the process exits unexpectedly before providing an address.
         """
-        binary = self.find_binary(self._config_dir)
+        binary = self.find_binary()
         if binary is None:
             raise FileNotFoundError(
                 "Yggdrasil binary not found. Install it or place it at "
