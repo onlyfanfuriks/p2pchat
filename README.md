@@ -23,26 +23,26 @@ Peer-to-peer encrypted terminal chat over the [Yggdrasil](https://yggdrasil-netw
 ### uv (recommended)
 
 ```bash
-uv tool install git+<repo-url>
+uv tool install git+https://github.com/onlyfanfuriks/p2pchat.git
 ```
 
 ### pipx
 
 ```bash
-pipx install git+<repo-url>
+pipx install git+https://github.com/onlyfanfuriks/p2pchat.git
 ```
 
 ### pip
 
 ```bash
-git clone <repo-url> && cd chat
+git clone https://github.com/onlyfanfuriks/p2pchat.git && cd p2pchat
 pip install .
 ```
 
 ### Development
 
 ```bash
-git clone <repo-url> && cd chat
+git clone https://github.com/onlyfanfuriks/p2pchat.git && cd p2pchat
 uv sync          # or: poetry install
 ```
 
