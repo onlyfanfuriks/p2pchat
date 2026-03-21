@@ -76,14 +76,16 @@ def build_invite(ygg_address: str, port: int, ed25519_pub_b64: str, display_name
 class ShowInviteModal(ModalScreen[None]):
     """Display the local user's invite link for copying."""
 
-    def __init__(self, invite_link: str) -> None:
+    def __init__(self, invite_link: str, fingerprint: str = "") -> None:
         self._invite_link = invite_link
+        self._fingerprint = fingerprint
         super().__init__()
 
     def compose(self) -> ComposeResult:
         yield Grid(
             Label("Your Invite Link", classes="modal-title"),
             Static(self._invite_link, id="invite-text"),
+            Label(f"Your fingerprint:\n{self._fingerprint}") if self._fingerprint else Static(""),
             Label("Share this link with contacts via a separate channel."),
             Button("Copy", variant="primary", id="copy-btn"),
             Button("Close", id="close-btn"),

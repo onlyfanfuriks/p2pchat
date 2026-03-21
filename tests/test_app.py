@@ -381,13 +381,14 @@ class TestChatAppOutboxIntegration:
         with pytest.raises(RuntimeError):
             await app._connect_for_outbox("peer1")
 
-    async def test_connect_for_outbox_no_contact_raises(self):
+    async def test_connect_for_outbox_no_contact_raises(self, tmp_path):
         """_connect_for_outbox raises for unknown contact."""
         app = ChatApp()
         app._account = _make_account()
         mock_storage = MagicMock()
         mock_storage.get_contact = AsyncMock(return_value=None)
         app._storage = mock_storage
+        app._config_dir = tmp_path
 
         with pytest.raises(ValueError, match="No address"):
             await app._connect_for_outbox("peer1")

@@ -171,7 +171,7 @@ class ChatScreen(Screen):
             return
 
         from ..widgets.invite_modal import ShowInviteModal, build_invite
-        from p2pchat.core.crypto import encode_public_key
+        from p2pchat.core.crypto import display_fingerprint, encode_public_key
         from p2pchat.core.protocol import PORT
 
         link = build_invite(
@@ -180,7 +180,8 @@ class ChatScreen(Screen):
             encode_public_key(self._account.ed25519_public),
             self._account.display_name,
         )
-        self.app.push_screen(ShowInviteModal(link))
+        fingerprint = display_fingerprint(self._account.ed25519_public)
+        self.app.push_screen(ShowInviteModal(link, fingerprint))
 
     def action_open_invite(self) -> None:
         from ..widgets.invite_modal import ConnectInviteModal, InviteInfo

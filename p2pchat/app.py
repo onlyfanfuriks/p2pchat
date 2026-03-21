@@ -10,8 +10,12 @@ import asyncio
 import logging
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from textual.app import App
+from textual.app import App, ComposeResult
+from textual.containers import Grid
+from textual.screen import ModalScreen
+from textual.widgets import Button, Label, Static
 
 from p2pchat.core.account import Account
 from p2pchat.core.delivery.outbox import Outbox
@@ -20,7 +24,42 @@ from p2pchat.core.storage import Storage, derive_db_key
 from p2pchat.ui.screens.unlock import UnlockScreen
 from p2pchat.ui.screens.chat import ChatScreen, ConnectRequest
 
+if TYPE_CHECKING:
+    from p2pchat.core.network.session import PeerSession
+
 log = logging.getLogger(__name__)
+
+
+class _VerifyModal(ModalScreen[bool]):
+    """Prompt user to verify an unknown peer's fingerprint (TOFU)."""
+
+    def __init__(
+        self,
+        display_name: str,
+        their_fingerprint: str,
+        my_fingerprint: str,
+    ) -> None:
+        self._display_name = display_name
+        self._their_fingerprint = their_fingerprint
+        self._my_fingerprint = my_fingerprint
+        super().__init__()
+
+    def compose(self) -> ComposeResult:
+        yield Grid(
+            Label("New Contact", classes="modal-title"),
+            Label(f"Display name: [bold]{self._display_name}[/bold]"),
+            Label(f"Their fingerprint:\n{self._their_fingerprint}"),
+            Static(""),
+            Label(f"Your fingerprint (share with them):\n{self._my_fingerprint}"),
+            Static(""),
+            Label("Verify out-of-band (phone, Signal, etc.)"),
+            Button("Trust & Connect", variant="success", id="trust"),
+            Button("Reject", variant="error", id="reject"),
+            id="invite-dialog",
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "trust")
 
 
 class ChatApp(App):
@@ -40,7 +79,7 @@ class ChatApp(App):
         self._start_network_task: asyncio.Task | None = None
         self._outbox: Outbox | None = None
         self._password: str | None = None
-        self._sessions: dict[str, object] = {}  # peer_id -> PeerSession
+        self._sessions: dict[str, PeerSession] = {}
         self._background_tasks: set[asyncio.Task] = set()
 
     async def on_mount(self) -> None:
@@ -118,7 +157,7 @@ class ChatApp(App):
 
     async def _start_yggdrasil(self) -> None:
         """Start Yggdrasil subprocess and obtain IPv6 address."""
-        if self._account is None:
+        if self._account is None or self._config_dir is None:
             return
 
         from p2pchat.core.account import ACCOUNT_DIR
@@ -158,12 +197,14 @@ class ChatApp(App):
 
         # Update chat screen status bar with address.
         if self._chat_screen:
-            status = self._chat_screen.query_one("#status-bar")
+            from p2pchat.ui.widgets.status_bar import StatusBar
+
+            status = self._chat_screen.query_one("#status-bar", StatusBar)
             status.ygg_address = address
 
     async def _start_chat_server(self) -> None:
         """Start the TLS TCP server for incoming connections."""
-        if self._account is None or self._storage is None:
+        if self._account is None or self._storage is None or self._config_dir is None:
             return
 
         from p2pchat.core.network.server import ChatServer
@@ -221,9 +262,10 @@ class ChatApp(App):
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
-    async def _on_session_ready(self, session) -> None:
+    async def _on_session_ready(self, session: PeerSession) -> None:
         """Handle a fully-handshaked session (incoming or outgoing)."""
         peer_id = session.peer_id
+        log.info("Session ready: peer=%s", peer_id)
         self._sessions[peer_id] = session
 
         if self._chat_screen:
@@ -259,7 +301,11 @@ class ChatApp(App):
                     )
 
                     await session.send_ack(chat_msg.message_id)
+                    log.debug("Received message from %s: id=%s", peer_id, chat_msg.message_id)
+        except Exception as exc:
+            log.warning("Receive loop ended for %s: %s", peer_id, exc)
         finally:
+            log.info("Session ended: peer=%s", peer_id)
             # Only remove if we're still the registered session (avoids
             # clobbering a newer session for the same peer).
             if self._sessions.get(peer_id) is session:
@@ -271,27 +317,24 @@ class ChatApp(App):
         self, peer_id: str, display_name: str, fingerprint: str
     ) -> bool:
         """Prompt the user to verify an unknown peer's fingerprint."""
-        from textual.screen import ModalScreen
-        from textual.app import ComposeResult
-        from textual.containers import Grid
-        from textual.widgets import Button, Label
+        if self._account is None:
+            return False
 
-        class VerifyModal(ModalScreen[bool]):
-            def compose(self) -> ComposeResult:
-                yield Grid(
-                    Label("New Contact", classes="modal-title"),
-                    Label(f"Display name: {display_name}"),
-                    Label(f"Fingerprint:\n{fingerprint}"),
-                    Label("Verify this matches what they sent you."),
-                    Button("Trust & Connect", variant="success", id="trust"),
-                    Button("Reject", variant="error", id="reject"),
-                    id="invite-dialog",
-                )
+        from p2pchat.core.crypto import display_fingerprint
 
-            def on_button_pressed(self, event: Button.Pressed) -> None:
-                self.dismiss(event.button.id == "trust")
+        my_fingerprint = display_fingerprint(self._account.ed25519_public)
 
-        future = self.push_screen_wait(VerifyModal())
+        log.info("Verify peer: %s (%s) fingerprint=%s", peer_id, display_name, fingerprint)
+
+        future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+
+        def _on_result(accepted: bool | None) -> None:
+            log.info("Verify peer result: %s (%s) accepted=%s", peer_id, display_name, accepted)
+            if not future.done():
+                future.set_result(bool(accepted))
+
+        modal = _VerifyModal(display_name, fingerprint, my_fingerprint)
+        self.push_screen(modal, callback=_on_result)
         return await future
 
     async def _send_message(
@@ -300,7 +343,7 @@ class ChatApp(App):
         """Send a message to a peer via active session or outbox."""
         # Try active session first.
         session = self._sessions.get(peer_id)
-        if session and getattr(session, "state", None) == "active":
+        if session and session.state == "active":
             try:
                 wire_msg_id = await session.send_message(plaintext)
                 return wire_msg_id
@@ -325,9 +368,9 @@ class ChatApp(App):
         log.debug("No outbox — message to %s not queued", peer_id)
         return None
 
-    async def _connect_for_outbox(self, peer_id: str) -> object:
+    async def _connect_for_outbox(self, peer_id: str) -> PeerSession:
         """Connect to a peer for outbox delivery."""
-        if self._account is None or self._storage is None:
+        if self._account is None or self._storage is None or self._config_dir is None:
             raise RuntimeError("Not initialized")
 
         contact = await self._storage.get_contact(peer_id)

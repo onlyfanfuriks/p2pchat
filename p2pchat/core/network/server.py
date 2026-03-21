@@ -297,6 +297,8 @@ class ChatServer:
                 pass
             return
 
+        log.info("Crypto handshake complete with %s, starting identity verification", peer_addr)
+
         # Identity verification is interactive (user approves via modal) —
         # no timeout so the user has time to verify the fingerprint.
         try:

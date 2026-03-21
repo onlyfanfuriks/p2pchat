@@ -52,6 +52,7 @@ try:
 
     _SQLCIPHER = True
 except ImportError:
+    _sql = None
     _SQLCIPHER = False
 
 # -------------------------------------------------------------------------
@@ -186,7 +187,7 @@ class BackupManager:
     def _checkpoint_wal(self) -> None:
         """Flush WAL to messages.db so the backup gets a consistent snapshot."""
         db_path = self._config_dir / "messages.db"
-        if not db_path.exists() or self._db_key is None or not _SQLCIPHER:
+        if not db_path.exists() or self._db_key is None or not _SQLCIPHER or _sql is None:
             return
 
         conn = _sql.connect(str(db_path), check_same_thread=False)

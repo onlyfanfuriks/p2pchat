@@ -29,7 +29,7 @@ import uuid
 from dataclasses import dataclass, field
 from importlib.resources import files as _resource_files
 from pathlib import Path
-from typing import Callable, Literal, TypeVar
+from typing import Any, Callable, Literal, TypeVar
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -300,7 +300,7 @@ class Storage:
             finally:
                 os.close(fd)
 
-        conn = _sql.connect(str(self._db_path), check_same_thread=False)
+        conn: Any = _sql.connect(str(self._db_path), check_same_thread=False)
 
         # SEC: wrap PRAGMA key so the hex key never appears in tracebacks.
         # (The key is in the SQL string; 'from None' suppresses the chain.)
@@ -342,7 +342,8 @@ class Storage:
     # Internal helpers
     # -----------------------------------------------------------------------
 
-    def _c(self) -> "_sql.Connection":
+    def _c(self) -> Any:
+        """Return the active SQLCipher connection, or raise if not initialized."""
         if self._conn is None:
             raise RuntimeError("Storage not initialized; call initialize() first")
         return self._conn

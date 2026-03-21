@@ -125,7 +125,7 @@ class PeerSession:
         self._peer_id: str | None = None
         self._peer_ed25519_pub: bytes | None = None
         self._peer_display_name: str = ""
-        self._state: Literal["handshaking", "active", "disconnected"] = "handshaking"
+        self._state: Literal["handshaking", "handshake_done", "active", "disconnected"] = "handshaking"
 
         # Tracks last time we sent any message (for ping scheduling).
         self._last_sent: float = time.monotonic()
@@ -147,7 +147,7 @@ class PeerSession:
         return self._peer_id
 
     @property
-    def state(self) -> Literal["handshaking", "active", "disconnected"]:
+    def state(self) -> Literal["handshaking", "handshake_done", "active", "disconnected"]:
         return self._state
 
     # ------------------------------------------------------------------
@@ -216,6 +216,7 @@ class PeerSession:
                     f"Expected handshake_ack, got {ack.type!r}"
                 )
             peer_payload = ack.payload
+            peer_from_id = ack.from_id
 
         else:
             # Step 1: receive initiator's handshake.
@@ -225,6 +226,7 @@ class PeerSession:
                     f"Expected handshake, got {msg.type!r}"
                 )
             peer_payload = msg.payload
+            peer_from_id = msg.from_id
 
         # --- Parse peer payload ---
         try:
@@ -274,7 +276,7 @@ class PeerSession:
                 WireMessage(
                     type="handshake_ack",
                     from_id=self._account.user_id,
-                    to_id=msg.from_id,
+                    to_id=peer_from_id,
                     timestamp=int(time.time() * 1000),
                     message_id=str(uuid.uuid4()),
                     payload=my_payload,
@@ -294,7 +296,7 @@ class PeerSession:
         self._peer_display_name = peer_display_name
 
         # N-12: Verify wire from_id matches payload identity key.
-        wire_from_id = ack.from_id if self._is_initiator else msg.from_id
+        wire_from_id = peer_from_id
         if wire_from_id != self._peer_id:
             raise ValueError(
                 f"Wire from_id {wire_from_id!r} does not match "
