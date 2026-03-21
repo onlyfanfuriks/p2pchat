@@ -415,7 +415,7 @@ class YggdrasilNode:
             If ``yggdrasil -genconf`` exits with a non-zero status.
         """
         if existing_json is None:
-            binary = self.find_binary(self._config_dir)
+            binary = self.find_binary()
             if binary is None:
                 raise FileNotFoundError(
                     "Yggdrasil binary not found; cannot generate config"
