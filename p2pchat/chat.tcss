@@ -1,0 +1,116 @@
+/* p2pchat — All visual styles */
+
+/* ------------------------------------------------------------------ */
+/* Status bar                                                         */
+/* ------------------------------------------------------------------ */
+
+StatusBar {
+    height: 1;
+    dock: top;
+    background: $panel;
+    color: $text-muted;
+    padding: 0 1;
+}
+
+StatusBar.status--accent {
+    background: $accent-darken-3;
+    color: $text;
+}
+
+StatusBar.status--error {
+    background: $error-darken-2;
+    color: $text;
+}
+
+StatusBar.status--warning {
+    background: $warning-darken-3;
+    color: $text;
+}
+
+StatusBar.status--success {
+    background: $success-darken-3;
+    color: $text;
+}
+
+/* ------------------------------------------------------------------ */
+/* Main chat layout                                                   */
+/* ------------------------------------------------------------------ */
+
+#main-pane {
+    height: 1fr;
+}
+
+#contact-list {
+    width: 24;
+    height: 100%;
+    border-right: tall $surface;
+}
+
+#message-list {
+    width: 1fr;
+    height: 100%;
+    padding: 0 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Chat input                                                         */
+/* ------------------------------------------------------------------ */
+
+ChatInput {
+    dock: bottom;
+    height: 3;
+    border-top: tall $accent;
+    padding: 0 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Unlock screen                                                      */
+/* ------------------------------------------------------------------ */
+
+#unlock-box {
+    width: 50;
+    height: auto;
+    padding: 2 4;
+    border: round $accent;
+    background: $surface;
+}
+
+#app-title {
+    text-align: center;
+    text-style: bold;
+    color: $accent;
+    margin-bottom: 1;
+}
+
+#error-label {
+    margin-top: 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Invite modals                                                      */
+/* ------------------------------------------------------------------ */
+
+#invite-dialog, #connect-dialog {
+    grid-size: 1;
+    grid-gutter: 1;
+    padding: 1 2;
+    width: 60;
+    height: auto;
+    border: round $accent;
+    background: $surface;
+}
+
+.modal-title {
+    text-style: bold;
+    text-align: center;
+    color: $accent;
+}
+
+#invite-text {
+    padding: 1;
+    background: $panel;
+}
+
+#invite-error {
+    color: $error;
+}

@@ -1,0 +1,33 @@
+# Build / runtime
+/temp
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+
+# IDE
+.vscode/
+
+# Logs
+*.log
+
+# Coverage
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+
+uv.lock
+
+# Python version manager
+.python-version
+
+.claude/
+.ruff_cache/
+.pytest_cache/
