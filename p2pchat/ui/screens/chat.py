@@ -192,7 +192,7 @@ class ChatScreen(Screen):
                 )
                 # The App layer will handle the actual connection.
                 self.app.post_message(
-                    _ConnectRequest(info)
+                    ConnectRequest(info)
                 )
 
         self.app.push_screen(ConnectInviteModal(), _on_result)
@@ -223,8 +223,8 @@ class ChatScreen(Screen):
         self.query_one("#chat-input", ChatInput).focus()
 
 
-class _ConnectRequest(Message):
-    """Internal message forwarded to the App for connection handling."""
+class ConnectRequest(Message):
+    """Message forwarded to the App for connection handling."""
 
     def __init__(self, info) -> None:
         self.info = info

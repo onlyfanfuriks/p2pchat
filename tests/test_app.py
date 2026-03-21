@@ -391,3 +391,124 @@ class TestChatAppOutboxIntegration:
 
         with pytest.raises(ValueError, match="No address"):
             await app._connect_for_outbox("peer1")
+
+
+# ---------------------------------------------------------------------------
+# TestChatAppConnectRequest
+# ---------------------------------------------------------------------------
+
+class TestChatAppConnectRequest:
+    def _make_info(self, name="Bob", address="200:beef::1", port=7331):
+        from p2pchat.ui.widgets.invite_modal import InviteInfo
+        return InviteInfo(
+            ygg_address=address,
+            port=port,
+            ed25519_pub=b"\x00" * 32,
+            display_name=name,
+        )
+
+    def _make_event(self, info=None):
+        from p2pchat.ui.screens.chat import ConnectRequest
+        return ConnectRequest(info or self._make_info())
+
+    async def test_connect_not_initialized(self):
+        """Connect request before init notifies error."""
+        app = ChatApp()
+        app._account = None
+        app.notify = MagicMock()
+
+        await app.on_connect_request(self._make_event())
+        app.notify.assert_called_once_with("Not initialized yet", severity="error")
+
+    async def test_connect_success(self):
+        """Successful connect creates session task."""
+        app = ChatApp()
+        app._account = _make_account()
+        app._storage = MagicMock()
+        app._config_dir = MagicMock()
+        app.notify = MagicMock()
+
+        mock_session = MagicMock()
+        mock_session.peer_id = "peer-bob"
+
+        with patch("p2pchat.core.network.peer.connect", new_callable=AsyncMock, return_value=mock_session) as mock_connect:
+            # Patch _on_session_ready to avoid real receive loop.
+            with patch.object(app, "_on_session_ready", new_callable=AsyncMock):
+                await app.on_connect_request(self._make_event())
+                mock_connect.assert_awaited_once()
+
+        # Should have notified connecting and connected.
+        calls = [c.args[0] for c in app.notify.call_args_list]
+        assert any("Connecting" in c for c in calls)
+        assert any("Connected" in c for c in calls)
+
+    async def test_connect_timeout(self):
+        """Timeout during connect notifies error."""
+        import asyncio as _aio
+        app = ChatApp()
+        app._account = _make_account()
+        app._storage = MagicMock()
+        app._config_dir = MagicMock()
+        app.notify = MagicMock()
+
+        with patch("p2pchat.core.network.peer.connect", new_callable=AsyncMock, side_effect=_aio.TimeoutError):
+            await app.on_connect_request(self._make_event())
+
+        calls = [c.args[0] for c in app.notify.call_args_list]
+        assert any("timed out" in c for c in calls)
+
+    async def test_connect_os_error(self):
+        """Network error during connect notifies error."""
+        app = ChatApp()
+        app._account = _make_account()
+        app._storage = MagicMock()
+        app._config_dir = MagicMock()
+        app.notify = MagicMock()
+
+        with patch("p2pchat.core.network.peer.connect", new_callable=AsyncMock, side_effect=OSError("No route")):
+            await app.on_connect_request(self._make_event())
+
+        calls = [c.args[0] for c in app.notify.call_args_list]
+        assert any("Cannot reach" in c for c in calls)
+
+    async def test_connect_generic_exception(self):
+        """Unexpected error during connect notifies error."""
+        app = ChatApp()
+        app._account = _make_account()
+        app._storage = MagicMock()
+        app._config_dir = MagicMock()
+        app.notify = MagicMock()
+
+        with patch("p2pchat.core.network.peer.connect", new_callable=AsyncMock, side_effect=RuntimeError("boom")):
+            await app.on_connect_request(self._make_event())
+
+        calls = [c.args[0] for c in app.notify.call_args_list]
+        assert any("failed" in c.lower() for c in calls)
+
+    async def test_connect_uses_display_name_in_notification(self):
+        """Notification uses display name when available."""
+        app = ChatApp()
+        app._account = _make_account()
+        app._storage = MagicMock()
+        app._config_dir = MagicMock()
+        app.notify = MagicMock()
+
+        with patch("p2pchat.core.network.peer.connect", new_callable=AsyncMock, side_effect=OSError("nope")):
+            await app.on_connect_request(self._make_event(self._make_info(name="Alice")))
+
+        calls = [c.args[0] for c in app.notify.call_args_list]
+        assert any("Alice" in c for c in calls)
+
+    async def test_connect_falls_back_to_address_when_no_name(self):
+        """Uses address when display name is empty."""
+        app = ChatApp()
+        app._account = _make_account()
+        app._storage = MagicMock()
+        app._config_dir = MagicMock()
+        app.notify = MagicMock()
+
+        with patch("p2pchat.core.network.peer.connect", new_callable=AsyncMock, side_effect=OSError("nope")):
+            await app.on_connect_request(self._make_event(self._make_info(name="")))
+
+        calls = [c.args[0] for c in app.notify.call_args_list]
+        assert any("200:beef::1" in c for c in calls)

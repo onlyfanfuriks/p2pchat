@@ -18,7 +18,7 @@ from p2pchat.core.delivery.outbox import Outbox
 from p2pchat.core.storage import Storage, derive_db_key
 
 from p2pchat.ui.screens.unlock import UnlockScreen
-from p2pchat.ui.screens.chat import ChatScreen
+from p2pchat.ui.screens.chat import ChatScreen, ConnectRequest
 
 log = logging.getLogger(__name__)
 
@@ -177,6 +177,49 @@ class ChatApp(App):
         )
         self._chat_server = server
         await server.start(self._account.ygg_address)
+
+    async def on_connect_request(self, event: ConnectRequest) -> None:
+        """Handle invite-link connect request from ChatScreen."""
+        info = event.info
+        name = info.display_name or info.ygg_address
+        log.info("Connect request: %s:%d (%s)", info.ygg_address, info.port, name)
+
+        if self._account is None or self._storage is None or self._config_dir is None:
+            self.notify("Not initialized yet", severity="error")
+            return
+
+        from p2pchat.core.network.peer import connect
+
+        self.notify(f"Connecting to {name}...")
+
+        try:
+            session = await connect(
+                info.ygg_address,
+                info.port,
+                self._account,
+                self._storage,
+                self._config_dir,
+                self._verify_peer,
+            )
+        except asyncio.TimeoutError:
+            log.warning("Connection to %s timed out", name)
+            self.notify(f"Connection to {name} timed out", severity="error")
+            return
+        except OSError as exc:
+            log.warning("Connection to %s failed: %s", name, exc)
+            self.notify(f"Cannot reach {name}: {exc}", severity="error")
+            return
+        except Exception as exc:
+            log.error("Connection to %s failed: %s", name, exc, exc_info=True)
+            self.notify(f"Connection failed: {exc}", severity="error")
+            return
+
+        self.notify(f"Connected to {name}")
+        log.info("Connected to %s (peer_id=%s)", name, session.peer_id)
+
+        task = asyncio.create_task(self._on_session_ready(session))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def _on_session_ready(self, session) -> None:
         """Handle a fully-handshaked session (incoming or outgoing)."""
