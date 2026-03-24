@@ -3,6 +3,7 @@
 Tests screen transitions, shutdown, and initialization flow.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -118,7 +119,7 @@ class TestChatAppSendMessage:
 
         result = await app._send_message("peer1", "hello", "msg-1")
         assert result == "wire-id"
-        session.send_message.assert_awaited_once_with("hello")
+        session.send_message.assert_awaited_once_with("hello", "msg-1")
 
     async def test_send_falls_through_to_outbox_on_session_failure(self):
         """If session send fails, message is enqueued in outbox."""
@@ -272,6 +273,14 @@ def _mock_session_with_empty_loop(peer_id="peer1"):
     return session
 
 
+def _mock_chat_screen():
+    """Create a MagicMock chat screen with async on_peer_online/offline."""
+    screen = MagicMock()
+    screen.on_peer_online = AsyncMock()
+    screen.on_peer_offline = AsyncMock()
+    return screen
+
+
 class TestChatAppOnSessionReady:
     async def test_on_session_ready_no_chat_screen(self):
         """Session ready with no chat screen doesn't crash."""
@@ -282,14 +291,14 @@ class TestChatAppOnSessionReady:
     async def test_on_session_ready_tracks_session(self):
         """Session is registered and unregistered in _sessions."""
         app = ChatApp()
-        app._chat_screen = MagicMock()
+        app._chat_screen = _mock_chat_screen()
         await app._on_session_ready(_mock_session_with_empty_loop())
         assert "peer1" not in app._sessions
 
     async def test_on_session_ready_drains_outbox(self):
         """Session ready drains outbox and cancels retry."""
         app = ChatApp()
-        app._chat_screen = MagicMock()
+        app._chat_screen = _mock_chat_screen()
         mock_outbox = MagicMock()
         mock_outbox.drain = AsyncMock(return_value=0)
         mock_outbox.cancel_retry = MagicMock()
@@ -304,7 +313,7 @@ class TestChatAppOnSessionReady:
     async def test_on_session_ready_restarts_retry_on_drain_failure(self):
         """If drain fails, retry loop is restarted."""
         app = ChatApp()
-        app._chat_screen = MagicMock()
+        app._chat_screen = _mock_chat_screen()
         mock_outbox = MagicMock()
         mock_outbox.drain = AsyncMock(side_effect=ConnectionError("dead"))
         mock_outbox.cancel_retry = MagicMock()
@@ -317,7 +326,7 @@ class TestChatAppOnSessionReady:
     async def test_on_session_ready_preserves_newer_session(self):
         """Finally block doesn't remove a newer session for the same peer."""
         app = ChatApp()
-        app._chat_screen = MagicMock()
+        app._chat_screen = _mock_chat_screen()
         newer_session = MagicMock()
 
         mock_session_old = MagicMock()
@@ -433,12 +442,10 @@ class TestChatAppConnectRequest:
         mock_session.peer_id = "peer-bob"
 
         with patch("p2pchat.core.network.peer.connect", new_callable=AsyncMock, return_value=mock_session) as mock_connect:
-            # Patch _on_session_ready to avoid real receive loop.
             with patch.object(app, "_on_session_ready", new_callable=AsyncMock):
-                await app.on_connect_request(self._make_event())
+                await app._do_connect(self._make_info())
                 mock_connect.assert_awaited_once()
 
-        # Should have notified connecting and connected.
         calls = [c.args[0] for c in app.notify.call_args_list]
         assert any("Connecting" in c for c in calls)
         assert any("Connected" in c for c in calls)
@@ -453,7 +460,7 @@ class TestChatAppConnectRequest:
         app.notify = MagicMock()
 
         with patch("p2pchat.core.network.peer.connect", new_callable=AsyncMock, side_effect=_aio.TimeoutError):
-            await app.on_connect_request(self._make_event())
+            await app._do_connect(self._make_info())
 
         calls = [c.args[0] for c in app.notify.call_args_list]
         assert any("timed out" in c for c in calls)
@@ -467,7 +474,7 @@ class TestChatAppConnectRequest:
         app.notify = MagicMock()
 
         with patch("p2pchat.core.network.peer.connect", new_callable=AsyncMock, side_effect=OSError("No route")):
-            await app.on_connect_request(self._make_event())
+            await app._do_connect(self._make_info())
 
         calls = [c.args[0] for c in app.notify.call_args_list]
         assert any("Cannot reach" in c for c in calls)
@@ -481,7 +488,7 @@ class TestChatAppConnectRequest:
         app.notify = MagicMock()
 
         with patch("p2pchat.core.network.peer.connect", new_callable=AsyncMock, side_effect=RuntimeError("boom")):
-            await app.on_connect_request(self._make_event())
+            await app._do_connect(self._make_info())
 
         calls = [c.args[0] for c in app.notify.call_args_list]
         assert any("failed" in c.lower() for c in calls)
@@ -495,7 +502,7 @@ class TestChatAppConnectRequest:
         app.notify = MagicMock()
 
         with patch("p2pchat.core.network.peer.connect", new_callable=AsyncMock, side_effect=OSError("nope")):
-            await app.on_connect_request(self._make_event(self._make_info(name="Alice")))
+            await app._do_connect(self._make_info(name="Alice"))
 
         calls = [c.args[0] for c in app.notify.call_args_list]
         assert any("Alice" in c for c in calls)
@@ -509,7 +516,23 @@ class TestChatAppConnectRequest:
         app.notify = MagicMock()
 
         with patch("p2pchat.core.network.peer.connect", new_callable=AsyncMock, side_effect=OSError("nope")):
-            await app.on_connect_request(self._make_event(self._make_info(name="")))
+            await app._do_connect(self._make_info(name=""))
 
         calls = [c.args[0] for c in app.notify.call_args_list]
         assert any("200:beef::1" in c for c in calls)
+
+    async def test_on_connect_request_spawns_background_task(self):
+        """on_connect_request dispatches to background task, doesn't block."""
+        app = ChatApp()
+        app._account = _make_account()
+        app._storage = MagicMock()
+        app._config_dir = MagicMock()
+        app.notify = MagicMock()
+
+        with patch.object(app, "_do_connect", new_callable=AsyncMock) as mock_do:
+            await app.on_connect_request(self._make_event())
+            # Task was spawned (not awaited inline).
+            assert len(app._background_tasks) == 1
+            # Wait for it to finish.
+            await asyncio.gather(*app._background_tasks)
+            mock_do.assert_awaited_once()

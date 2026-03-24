@@ -548,6 +548,24 @@ class Storage:
 
         return await self._run(_fn)
 
+    async def mark_all_delivered(self, peer_id: str) -> int:
+        """Mark all undelivered sent messages to a peer as delivered.
+
+        Returns the number of rows updated.
+        """
+        def _fn():
+            conn = self._c()
+            with conn:
+                cur = conn.execute(
+                    "UPDATE messages SET delivered = 1 "
+                    "WHERE peer_id = ? AND direction = 'sent' "
+                    "AND delivered = 0 AND deleted = 0",
+                    (peer_id,),
+                )
+                return cur.rowcount
+
+        return await self._run(_fn)
+
     async def delete_conversation(self, peer_id: str) -> None:
         """Soft-delete all messages with peer and purge their outbox entries."""
         def _fn():

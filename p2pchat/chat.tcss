@@ -61,6 +61,7 @@ ChatInput {
     height: 3;
     border-top: tall $accent;
     padding: 0 1;
+    margin-top: 1;
 }
 
 /* ------------------------------------------------------------------ */

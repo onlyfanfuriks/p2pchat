@@ -90,7 +90,6 @@ class ChatScreen(Screen):
         cl.clear_unread(event.peer_id)
         self._unread.pop(event.peer_id, None)
         await self._load_messages(event.peer_id)
-        self.query_one("#chat-input", ChatInput).focus()
 
     async def _load_messages(self, peer_id: str) -> None:
         messages = await self._storage.get_messages(peer_id, limit=200)
@@ -136,11 +135,16 @@ class ChatScreen(Screen):
     # Public interface for the App to push updates
     # ------------------------------------------------------------------
 
-    def on_message_received(
-        self, peer_id: str, msg: StorageMessage, peer_name: str
+    async def on_message_received(
+        self, peer_id: str, msg: StorageMessage, peer_name: str,
+        refresh_delivery: bool = False,
     ) -> None:
         """Called by App when a message arrives from the network."""
         if peer_id == self._selected_peer:
+            if refresh_delivery:
+                # Delivery status changed — reload to update all indicators.
+                await self._load_messages(peer_id)
+                return
             ml = self.query_one("#message-list", MessageList)
             ml.add_chat_message(msg, peer_name)
         else:
@@ -148,15 +152,18 @@ class ChatScreen(Screen):
             cl = self.query_one("#contact-list", ContactList)
             cl.increment_unread(peer_id)
 
-    def on_peer_online(self, peer_id: str) -> None:
+    async def on_peer_online(self, peer_id: str) -> None:
         self._online_peers.add(peer_id)
-        cl = self.query_one("#contact-list", ContactList)
-        cl.mark_online(peer_id, True)
+        await self._reload_contacts()
 
-    def on_peer_offline(self, peer_id: str) -> None:
+    async def on_peer_offline(self, peer_id: str) -> None:
         self._online_peers.discard(peer_id)
-        cl = self.query_one("#contact-list", ContactList)
-        cl.mark_online(peer_id, False)
+        await self._reload_contacts()
+
+    async def refresh_messages(self, peer_id: str) -> None:
+        """Reload message list if viewing this peer (updates delivery indicators)."""
+        if peer_id == self._selected_peer:
+            await self._load_messages(peer_id)
 
     def set_status(self, text: str, severity: str = "default") -> None:
         self.query_one("#status-bar", StatusBar).set_status(text, severity)
@@ -202,10 +209,38 @@ class ChatScreen(Screen):
         if not self._selected_peer:
             self.notify("No conversation selected", severity="warning")
             return
-        await self._storage.delete_conversation(self._selected_peer)
-        ml = self.query_one("#message-list", MessageList)
-        ml.clear()
-        self.notify("Conversation deleted")
+
+        from textual.screen import ModalScreen
+        from textual.containers import Grid
+        from textual.widgets import Button, Label
+
+        peer_id = self._selected_peer
+
+        class _ConfirmDelete(ModalScreen[bool]):
+            def compose(self) -> ComposeResult:
+                yield Grid(
+                    Label("Delete this contact and conversation?", classes="modal-title"),
+                    Label("All messages will be permanently removed."),
+                    Button("Delete", variant="error", id="confirm"),
+                    Button("Cancel", variant="default", id="cancel"),
+                    id="invite-dialog",
+                )
+
+            def on_button_pressed(self, event: Button.Pressed) -> None:
+                self.dismiss(event.button.id == "confirm")
+
+        async def _on_confirmed(confirmed: bool | None) -> None:
+            if not confirmed:
+                return
+            await self._storage.delete_contact(peer_id)
+            self.query_one("#message-list", MessageList).clear()
+            self._selected_peer = None
+            self._online_peers.discard(peer_id)
+            self._unread.pop(peer_id, None)
+            await self._reload_contacts()
+            self.notify("Contact deleted")
+
+        self.app.push_screen(_ConfirmDelete(), _on_confirmed)
 
     def action_backup(self) -> None:
         self.notify("Backup: use CLI 'p2pchat backup' command", severity="information")
@@ -218,7 +253,16 @@ class ChatScreen(Screen):
 
     def action_toggle_contacts(self) -> None:
         cl = self.query_one("#contact-list", ContactList)
-        cl.display = not cl.display
+        if not cl.display:
+            # Hidden → show and focus.
+            cl.display = True
+            cl.focus()
+        elif cl.has_focus:
+            # Visible and focused → move focus to input.
+            self.query_one("#chat-input", ChatInput).focus()
+        else:
+            # Visible but not focused → focus it.
+            cl.focus()
 
     def action_focus_input(self) -> None:
         self.query_one("#chat-input", ChatInput).focus()
@@ -230,3 +274,5 @@ class ConnectRequest(Message):
     def __init__(self, info) -> None:
         self.info = info
         super().__init__()
+
+

@@ -63,7 +63,8 @@ class ContactList(OptionList):
     def _rebuild(self) -> None:
         """Reconstruct option items from current state."""
         self.clear_options()
-        for pid, contact in self._contacts.items():
+        selected_index: int | None = None
+        for i, (pid, contact) in enumerate(self._contacts.items()):
             dot = "\u25cf" if pid in self._online else "\u25cb"
             badge = ""
             count = self._unread.get(pid, 0)
@@ -71,6 +72,10 @@ class ContactList(OptionList):
                 badge = f" [{count}]"
             label = f"{dot} {escape(contact.display_name)}{badge}"
             self.add_option(Option(label, id=pid))
+            if pid == self.selected_peer:
+                selected_index = i
+        if selected_index is not None:
+            self.highlighted = selected_index
 
     def on_option_list_option_selected(
         self, event: OptionList.OptionSelected

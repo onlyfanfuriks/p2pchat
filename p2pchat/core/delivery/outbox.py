@@ -10,14 +10,20 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, Awaitable, Callable
+
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from p2pchat.core.crypto import (
     decode_public_key,
     decrypt_message,
     derive_session_key,
     encrypt_message,
+    private_key_to_bytes,
 )
 from p2pchat.core.storage import OutboxItem, Storage
 
@@ -33,6 +39,26 @@ _BACKOFF_SCHEDULE = (30, 60, 120, 300, 600)
 # Domain-separated HKDF info tag for outbox pre-encryption keys.
 # Distinct from session keys to prevent cross-domain key reuse.
 _HKDF_OUTBOX_INFO = b"p2pchat-v1-outbox-key"
+
+# HKDF info tag for self-encryption when peer's X25519 key is unavailable.
+_HKDF_SELF_INFO = b"p2pchat-v1-outbox-self-key"
+
+# Sentinel value in the signature field marking a self-encrypted item.
+_SELF_SIG = "self"
+
+
+def _derive_self_key(account: Account) -> bytes:
+    """Derive symmetric key for outbox self-encryption (no peer key needed).
+
+    Uses the account's Ed25519 private key with a distinct HKDF info tag.
+    """
+    raw = private_key_to_bytes(account.ed25519_private)
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=_HKDF_SELF_INFO,
+    ).derive(raw)
 
 
 def _derive_outbox_key(
@@ -70,14 +96,19 @@ class Outbox:
         plaintext: str,
         message_id: str | None = None,
     ) -> str:
-        """Pre-encrypt and store message in outbox. Returns outbox item id.
+        """Store message in outbox for later delivery. Returns outbox item id.
+
+        If the peer's X25519 key is available, the message is pre-encrypted.
+        Otherwise plaintext is stored directly (the DB is SQLCipher-encrypted
+        at rest). Plaintext items are sent through the session on drain, which
+        encrypts with the ephemeral session key.
 
         Parameters
         ----------
         to_id:
             Peer ID (base64url Ed25519 public key).
         plaintext:
-            Message content to encrypt and store.
+            Message content to store.
         message_id:
             Optional link to the Message row for TUI delivery status.
 
@@ -90,16 +121,22 @@ class Outbox:
         if contact is None:
             raise ValueError(f"Unknown contact: {to_id}")
 
-        their_x25519_pub = decode_public_key(contact.x25519_pub)
-        their_ed25519_pub = decode_public_key(to_id)
-        static_key = _derive_outbox_key(
-            self._account, their_x25519_pub, their_ed25519_pub,
-        )
-
-        enc = encrypt_message(static_key, plaintext, self._account.ed25519_private)
-
-        blob = base64.urlsafe_b64encode(enc.nonce + enc.ciphertext).decode()
-        sig = base64.urlsafe_b64encode(enc.signature).decode()
+        if contact.x25519_pub:
+            their_x25519_pub = decode_public_key(contact.x25519_pub)
+            their_ed25519_pub = decode_public_key(to_id)
+            static_key = _derive_outbox_key(
+                self._account, their_x25519_pub, their_ed25519_pub,
+            )
+            enc = encrypt_message(static_key, plaintext, self._account.ed25519_private)
+            blob = base64.urlsafe_b64encode(enc.nonce + enc.ciphertext).decode()
+            sig = base64.urlsafe_b64encode(enc.signature).decode()
+        else:
+            # No X25519 key yet — self-encrypt with account key.
+            self_key = _derive_self_key(self._account)
+            nonce = os.urandom(12)
+            ct = AESGCM(self_key).encrypt(nonce, plaintext.encode(), None)
+            blob = base64.urlsafe_b64encode(nonce + ct).decode()
+            sig = _SELF_SIG
 
         item = OutboxItem(
             peer_id=to_id,
@@ -114,9 +151,10 @@ class Outbox:
     async def drain(self, session: PeerSession) -> int:
         """Send all pending messages for session's peer. Returns count sent.
 
-        Decrypts pre-encrypted outbox items and re-sends through the active
-        session (which encrypts with the ephemeral session key). Items are
-        removed from the outbox on successful send.
+        Items with a signature are pre-encrypted and get decrypted first.
+        Items with an empty signature are stored plaintext (x25519 key was
+        unavailable at enqueue time) and are sent directly through the
+        session, which encrypts with the ephemeral session key.
 
         Concurrent drains for the same peer are prevented via a guard set.
         """
@@ -134,16 +172,33 @@ class Outbox:
             if contact is None:
                 return 0
 
-            their_x25519_pub = decode_public_key(contact.x25519_pub)
-            their_ed25519_pub = decode_public_key(peer_id)
-            static_key = _derive_outbox_key(
-                self._account, their_x25519_pub, their_ed25519_pub,
-            )
+            # Derive static key for encrypted items (if key is available).
+            static_key: bytes | None = None
+            if contact.x25519_pub:
+                their_x25519_pub = decode_public_key(contact.x25519_pub)
+                their_ed25519_pub = decode_public_key(peer_id)
+                static_key = _derive_outbox_key(
+                    self._account, their_x25519_pub, their_ed25519_pub,
+                )
 
             sent = 0
             for item in items:
                 try:
-                    plaintext = self._decrypt_item(item, static_key)
+                    if item.signature == _SELF_SIG:
+                        # Self-encrypted — decrypt with account key.
+                        plaintext = self._decrypt_self_item(item)
+                    elif not item.signature:
+                        # Legacy plaintext item — send directly.
+                        plaintext = item.encrypted_blob
+                    elif static_key is not None:
+                        plaintext = self._decrypt_item(item, static_key)
+                    else:
+                        # Encrypted but key unavailable — skip for now.
+                        log.warning(
+                            "Cannot decrypt outbox item %s — key not available",
+                            item.id,
+                        )
+                        continue
                 except Exception:
                     log.error(
                         "Corrupt outbox item %s — skipping", item.id,
@@ -154,6 +209,8 @@ class Outbox:
                 try:
                     await session.send_message(plaintext)
                     await self._storage.mark_outbox_delivered(item.id)
+                    if item.message_id:
+                        await self._storage.mark_delivered(item.message_id)
                     sent += 1
                 except Exception:
                     log.warning(
@@ -165,6 +222,14 @@ class Outbox:
             return sent
         finally:
             self._draining.discard(peer_id)
+
+    def _decrypt_self_item(self, item: OutboxItem) -> str:
+        """Decrypt a self-encrypted outbox item using the account key."""
+        self_key = _derive_self_key(self._account)
+        blob_bytes = base64.urlsafe_b64decode(item.encrypted_blob)
+        nonce = blob_bytes[:12]
+        ciphertext = blob_bytes[12:]
+        return AESGCM(self_key).decrypt(nonce, ciphertext, None).decode()
 
     def _decrypt_item(self, item: OutboxItem, static_key: bytes) -> str:
         """Decrypt a pre-encrypted outbox item to recover plaintext."""

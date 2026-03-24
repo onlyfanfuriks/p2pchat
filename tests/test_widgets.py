@@ -12,7 +12,6 @@ from p2pchat.ui.screens.contacts import ContactList
 from p2pchat.ui.widgets.chat_input import ChatInput
 from p2pchat.ui.widgets.message_list import (
     MessageList,
-    _delivery_indicator,
     _format_timestamp,
 )
 from p2pchat.ui.widgets.status_bar import StatusBar
@@ -41,25 +40,43 @@ class TestFormatTimestamp:
 # ---------------------------------------------------------------------------
 
 class TestDeliveryIndicator:
-    def test_received_message_no_indicator(self):
-        msg = Message(peer_id="x", direction="received", content="hi", timestamp=0)
-        assert _delivery_indicator(msg) == ""
+    async def test_received_message_no_indicator(self):
+        class TestApp(App):
+            def compose(self) -> ComposeResult:
+                yield MessageList(id="ml", highlight=True, markup=True)
 
-    def test_sent_delivered(self):
-        msg = Message(
-            peer_id="x", direction="sent", content="hi",
-            timestamp=0, delivered=True,
-        )
-        result = _delivery_indicator(msg)
-        assert "\u2713" in result  # checkmark
+        async with TestApp().run_test() as pilot:
+            ml = pilot.app.query_one("#ml", MessageList)
+            msg = Message(peer_id="x", direction="received", content="hi", timestamp=0)
+            assert ml._delivery_indicator(msg) == ""
 
-    def test_sent_undelivered(self):
-        msg = Message(
-            peer_id="x", direction="sent", content="hi",
-            timestamp=0, delivered=False,
-        )
-        result = _delivery_indicator(msg)
-        assert "\u23f3" in result  # hourglass
+    async def test_sent_delivered(self):
+        class TestApp(App):
+            def compose(self) -> ComposeResult:
+                yield MessageList(id="ml", highlight=True, markup=True)
+
+        async with TestApp().run_test() as pilot:
+            ml = pilot.app.query_one("#ml", MessageList)
+            msg = Message(
+                peer_id="x", direction="sent", content="hi",
+                timestamp=0, delivered=True,
+            )
+            result = ml._delivery_indicator(msg)
+            assert "\u2713" in str(result)  # checkmark
+
+    async def test_sent_undelivered(self):
+        class TestApp(App):
+            def compose(self) -> ComposeResult:
+                yield MessageList(id="ml", highlight=True, markup=True)
+
+        async with TestApp().run_test() as pilot:
+            ml = pilot.app.query_one("#ml", MessageList)
+            msg = Message(
+                peer_id="x", direction="sent", content="hi",
+                timestamp=0, delivered=False,
+            )
+            result = ml._delivery_indicator(msg)
+            assert "\u23f3" in str(result)  # hourglass
 
 
 # ---------------------------------------------------------------------------
@@ -209,14 +226,14 @@ class TestChatInput:
             await pilot.pause()
             assert submitted == ["hello"]
 
-    async def test_placeholder_text(self):
+    async def test_starts_empty(self):
         class TestApp(App):
             def compose(self) -> ComposeResult:
                 yield ChatInput(id="ci")
 
         async with TestApp().run_test() as pilot:
             ci = pilot.app.query_one("#ci", ChatInput)
-            assert "message" in ci.placeholder.lower()
+            assert ci.text == ""
 
 
 # ---------------------------------------------------------------------------

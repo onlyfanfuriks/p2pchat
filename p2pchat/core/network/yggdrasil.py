@@ -32,13 +32,19 @@ YGGDRASIL_VERSION = "0.5.13"
 # Public peers list
 # -------------------------------------------------------------------------
 
+# https://publicpeers.neilalexander.dev/
 PUBLIC_PEERS: list[str] = [
-    "tls://pl1.yggdrasil.iamthefij.com:18999",
-    "tls://ygg.loskiq.com:17314",
-    "tcp://longseason.1200bps.com:13122",
-    "tcp://188.225.9.167:18226",
-    "tls://yggno.de:18226",
-    "tls://ygg.mkg20001.io:443",
+    # Russia
+    "tls://srv.itrus.su:7992",
+    "tcp://ygg-msk-1.averyan.ru:8363",
+    # Europe
+    "tls://ygg1.mk16.de:1338",
+    "tls://vpn.itrus.su:7992",
+    # South America
+    "tcp://ygg-1.okade.pro:20000",
+    "tcp://satori.nadeko.net:44441",
+    # US
+    "tls://ygg8.mk16.de:1338",
 ]
 
 # Regex that matches Yggdrasil IPv6 addresses in log/stdout output.

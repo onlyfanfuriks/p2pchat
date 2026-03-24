@@ -115,9 +115,9 @@ class TestChatScreenPeerStatus:
 
         async with ChatTestApp(account, storage).run_test() as pilot:
             screen = pilot.app.screen
-            screen.on_peer_online("peer1")
+            await screen.on_peer_online("peer1")
             assert "peer1" in screen._online_peers
-            screen.on_peer_offline("peer1")
+            await screen.on_peer_offline("peer1")
             assert "peer1" not in screen._online_peers
         await storage.close()
 
@@ -142,7 +142,7 @@ class TestChatScreenMessageReceived:
             )
             ml = screen.query_one("#message-list", MessageList)
             initial_count = len(ml.lines)
-            screen.on_message_received("peer1", msg, "Bob")
+            await screen.on_message_received("peer1", msg, "Bob")
             await pilot.pause()
             assert len(ml.lines) > initial_count
         await storage.close()
@@ -160,7 +160,7 @@ class TestChatScreenMessageReceived:
                 peer_id="peer2", direction="received",
                 content="yo", timestamp=int(time.time()),
             )
-            screen.on_message_received("peer2", msg, "Charlie")
+            await screen.on_message_received("peer2", msg, "Charlie")
             assert screen._unread.get("peer2") == 1
         await storage.close()
 
@@ -188,7 +188,7 @@ class TestChatScreenSetStatus:
 # ---------------------------------------------------------------------------
 
 class TestChatScreenActions:
-    async def test_toggle_contacts_hides_panel(self, tmp_path):
+    async def test_toggle_contacts_cycles_focus(self, tmp_path):
         account = _make_account()
         storage = await _make_storage(tmp_path, account)
 
@@ -196,10 +196,18 @@ class TestChatScreenActions:
             screen = pilot.app.screen
             cl = screen.query_one("#contact-list", ContactList)
             assert cl.display is True
+
+            # First toggle when not focused → focuses contact list.
             screen.action_toggle_contacts()
-            assert cl.display is False
-            screen.action_toggle_contacts()
+            await pilot.pause()
             assert cl.display is True
+            assert cl.has_focus
+
+            # Second toggle when focused → moves focus to input.
+            screen.action_toggle_contacts()
+            await pilot.pause()
+            assert cl.display is True
+            assert not cl.has_focus
         await storage.close()
 
     async def test_delete_chat_no_peer_selected(self, tmp_path):
@@ -228,6 +236,9 @@ class TestChatScreenActions:
             screen = pilot.app.screen
             screen._selected_peer = "peer1"
             await screen.action_delete_chat()
+            await pilot.pause()
+            # Confirm the deletion in the modal.
+            await pilot.click("#confirm")
             await pilot.pause()
             # Messages should be soft-deleted.
             msgs = await storage.get_messages("peer1")

@@ -124,8 +124,15 @@ class PeerSession:
         self._session_key: bytes | None = None
         self._peer_id: str | None = None
         self._peer_ed25519_pub: bytes | None = None
+        self._peer_x25519_pub: str = ""
         self._peer_display_name: str = ""
+        self._peer_ygg_address: str = ""
         self._state: Literal["handshaking", "handshake_done", "active", "disconnected"] = "handshaking"
+
+        # Extract peer's IPv6 address from the TCP connection.
+        peername = writer.get_extra_info("peername")
+        if peername:
+            self._peer_ygg_address = str(peername[0])
 
         # Tracks last time we sent any message (for ping scheduling).
         self._last_sent: float = time.monotonic()
@@ -192,6 +199,7 @@ class PeerSession:
             my_payload = {
                 "ephemeral_x25519_pub": _b64enc(eph_pub_bytes),
                 "ed25519_pub": encode_public_key(self._account.ed25519_public),
+                "x25519_pub": encode_public_key(self._account.x25519_public),
                 "display_name": self._account.display_name,
                 "version": "1.0",
                 "handshake_sig": _b64enc(init_sig),
@@ -233,6 +241,7 @@ class PeerSession:
             their_eph_pub_bytes = _b64dec(peer_payload["ephemeral_x25519_pub"])
             their_ed_pub_encoded = peer_payload["ed25519_pub"]
             their_ed_pub_bytes = decode_public_key(their_ed_pub_encoded)
+            their_x25519_pub_encoded = peer_payload.get("x25519_pub", "")
             peer_display_name = str(peer_payload.get("display_name", ""))
             their_sig = _b64dec(peer_payload["handshake_sig"])
         except (KeyError, ValueError) as exc:
@@ -267,6 +276,7 @@ class PeerSession:
             my_payload = {
                 "ephemeral_x25519_pub": _b64enc(eph_pub_bytes),
                 "ed25519_pub": encode_public_key(self._account.ed25519_public),
+                "x25519_pub": encode_public_key(self._account.x25519_public),
                 "display_name": self._account.display_name,
                 "version": "1.0",
                 "handshake_sig": _b64enc(resp_sig),
@@ -293,6 +303,7 @@ class PeerSession:
 
         self._peer_id = encode_public_key(their_ed_pub_bytes)
         self._peer_ed25519_pub = their_ed_pub_bytes
+        self._peer_x25519_pub = their_x25519_pub_encoded
         self._peer_display_name = peer_display_name
 
         # N-12: Verify wire from_id matches payload identity key.
@@ -356,7 +367,8 @@ class PeerSession:
                 Contact(
                     peer_id=self._peer_id,
                     display_name=self._peer_display_name or contact.display_name,
-                    x25519_pub="",
+                    x25519_pub=self._peer_x25519_pub,
+                    ygg_address=self._peer_ygg_address or contact.ygg_address,
                     trusted=True,
                     added_at=contact.added_at,
                     last_seen=int(time.time()),
@@ -403,7 +415,8 @@ class PeerSession:
             Contact(
                 peer_id=self._peer_id,
                 display_name=self._peer_display_name,
-                x25519_pub="",
+                x25519_pub=self._peer_x25519_pub,
+                ygg_address=self._peer_ygg_address,
                 trusted=True,
                 added_at=added_at,
                 last_seen=int(time.time()),
@@ -414,8 +427,19 @@ class PeerSession:
     # Sending
     # ------------------------------------------------------------------
 
-    async def send_message(self, plaintext: str) -> str:
+    async def send_message(
+        self, plaintext: str, message_id: str | None = None,
+    ) -> str:
         """Encrypt, sign, and send a chat message.
+
+        Parameters
+        ----------
+        plaintext:
+            Message content.
+        message_id:
+            Optional ID to use as the wire message_id. When provided, ACKs
+            from the peer will reference this ID so delivery status can be
+            tracked in the local DB. If None, a new UUID is generated.
 
         Returns the ``message_id`` assigned to the message.
         """
@@ -434,7 +458,8 @@ class PeerSession:
             plaintext,
             self._account.ed25519_private,
         )
-        message_id = str(uuid.uuid4())
+        if message_id is None:
+            message_id = str(uuid.uuid4())
 
         await self._send_raw(
             WireMessage(
@@ -636,11 +661,12 @@ class PeerSession:
                     self._pong_event.set()
 
                 elif msg.type == "ack":
+                    acked_id = msg.payload.get("acked_id")
                     log.debug(
-                        "ACK from %s for %s",
-                        self._peer_id,
-                        msg.payload.get("acked_id", "?"),
+                        "ACK from %s for %s", self._peer_id, acked_id,
                     )
+                    if acked_id:
+                        await self._storage.mark_delivered(acked_id)
 
                 elif msg.type == "chat":
                     # Duplicate guard.

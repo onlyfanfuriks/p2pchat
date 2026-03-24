@@ -17,12 +17,15 @@ from textual.containers import Grid
 from textual.screen import ModalScreen
 from textual.widgets import Button, Label, Static
 
-from p2pchat.core.account import Account
+from p2pchat.core.account import ACCOUNT_DIR, Account
 from p2pchat.core.delivery.outbox import Outbox
 from p2pchat.core.storage import Storage, derive_db_key
 
+_THEME_FILE = ACCOUNT_DIR / "theme.conf"
+
 from p2pchat.ui.screens.unlock import UnlockScreen
 from p2pchat.ui.screens.chat import ChatScreen, ConnectRequest
+from p2pchat.ui.widgets.invite_modal import InviteInfo
 
 if TYPE_CHECKING:
     from p2pchat.core.network.session import PeerSession
@@ -81,9 +84,25 @@ class ChatApp(App):
         self._password: str | None = None
         self._sessions: dict[str, PeerSession] = {}
         self._background_tasks: set[asyncio.Task] = set()
+        self._reconnect_task: asyncio.Task | None = None
+        self._connecting: set[str] = set()
 
     async def on_mount(self) -> None:
+        try:
+            if _THEME_FILE.exists():
+                saved = _THEME_FILE.read_text().strip()
+                if saved in self.available_themes:
+                    self.theme = saved
+        except Exception:
+            pass
         self.push_screen(UnlockScreen())
+
+    def watch_theme(self, theme_name: str) -> None:
+        try:
+            _THEME_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _THEME_FILE.write_text(theme_name + "\n")
+        except Exception:
+            pass
 
     async def on_unlock_screen_unlocked(self, event: UnlockScreen.Unlocked) -> None:
         """Handle successful unlock: initialise storage and start network."""
@@ -155,6 +174,11 @@ class ChatApp(App):
         # Start outbox retry loops for peers with pending items.
         await self._start_outbox_retries()
 
+        # Periodically reconnect to offline contacts.
+        self._reconnect_task = asyncio.create_task(
+            self._reconnect_loop(), name="reconnect-loop",
+        )
+
     async def _start_yggdrasil(self) -> None:
         """Start Yggdrasil subprocess and obtain IPv6 address."""
         if self._account is None or self._config_dir is None:
@@ -220,14 +244,27 @@ class ChatApp(App):
         await server.start(self._account.ygg_address)
 
     async def on_connect_request(self, event: ConnectRequest) -> None:
-        """Handle invite-link connect request from ChatScreen."""
-        info = event.info
-        name = info.display_name or info.ygg_address
-        log.info("Connect request: %s:%d (%s)", info.ygg_address, info.port, name)
+        """Handle invite-link connect request from ChatScreen.
 
+        The actual connection runs in a background task so the App's
+        message pump stays unblocked — otherwise the verify modal can
+        never receive button clicks and the UI freezes.
+        """
         if self._account is None or self._storage is None or self._config_dir is None:
             self.notify("Not initialized yet", severity="error")
             return
+
+        task = asyncio.create_task(self._do_connect(event.info))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _do_connect(self, info: InviteInfo) -> None:
+        """Run the outgoing peer connection in a background task."""
+        if self._account is None or self._storage is None or self._config_dir is None:
+            return
+
+        name = info.display_name or info.ygg_address
+        log.info("Connect request: %s:%d (%s)", info.ygg_address, info.port, name)
 
         from p2pchat.core.network.peer import connect
 
@@ -258,9 +295,7 @@ class ChatApp(App):
         self.notify(f"Connected to {name}")
         log.info("Connected to %s (peer_id=%s)", name, session.peer_id)
 
-        task = asyncio.create_task(self._on_session_ready(session))
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        await self._on_session_ready(session)
 
     async def _on_session_ready(self, session: PeerSession) -> None:
         """Handle a fully-handshaked session (incoming or outgoing)."""
@@ -269,13 +304,16 @@ class ChatApp(App):
         self._sessions[peer_id] = session
 
         if self._chat_screen:
-            self._chat_screen.on_peer_online(peer_id)
+            await self._chat_screen.on_peer_online(peer_id)
 
         # Drain pending outbox items for this peer.
         if self._outbox:
             self._outbox.cancel_retry(peer_id)
             try:
-                await self._outbox.drain(session)
+                sent = await self._outbox.drain(session)
+                if sent > 0 and self._chat_screen:
+                    # Reload messages to update delivery indicators (⏳ → ✓).
+                    await self._chat_screen.refresh_messages(peer_id)
             except Exception as exc:
                 log.warning("Outbox drain failed for %s: %s", peer_id, exc)
                 self._outbox.start_retry(peer_id, self._connect_for_outbox)
@@ -294,10 +332,14 @@ class ChatApp(App):
                     )
                     await self._storage.save_message(msg)
 
+                    # Receiving a message proves the peer got ours.
+                    updated = await self._storage.mark_all_delivered(peer_id)
+
                     contact = await self._storage.get_contact(chat_msg.peer_id)
                     peer_name = contact.display_name if contact else ""
-                    self._chat_screen.on_message_received(
-                        chat_msg.peer_id, msg, peer_name
+                    await self._chat_screen.on_message_received(
+                        chat_msg.peer_id, msg, peer_name,
+                        refresh_delivery=updated > 0,
                     )
 
                     await session.send_ack(chat_msg.message_id)
@@ -311,7 +353,7 @@ class ChatApp(App):
             if self._sessions.get(peer_id) is session:
                 self._sessions.pop(peer_id, None)
             if self._chat_screen:
-                self._chat_screen.on_peer_offline(peer_id)
+                await self._chat_screen.on_peer_offline(peer_id)
 
     async def _verify_peer(
         self, peer_id: str, display_name: str, fingerprint: str
@@ -345,7 +387,11 @@ class ChatApp(App):
         session = self._sessions.get(peer_id)
         if session and session.state == "active":
             try:
-                wire_msg_id = await session.send_message(plaintext)
+                wire_msg_id = await session.send_message(plaintext, message_id)
+                if message_id and self._storage:
+                    await self._storage.mark_delivered(message_id)
+                    if self._chat_screen:
+                        await self._chat_screen.refresh_messages(peer_id)
                 return wire_msg_id
             except Exception as exc:
                 log.warning("Direct send to %s failed: %s", peer_id, exc)
@@ -386,7 +432,7 @@ class ChatApp(App):
             self._account,
             self._storage,
             self._config_dir,
-            self._verify_peer,
+            # No verify callback — only deliver to already-trusted peers.
         )
 
         # Handle session lifecycle (receive loop) in background.
@@ -395,6 +441,67 @@ class ChatApp(App):
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return session
+
+    async def _reconnect_loop(self) -> None:
+        """Periodically try to connect to offline trusted contacts."""
+        while True:
+            await asyncio.sleep(15)
+            await self._try_reconnect_all()
+
+    async def _try_reconnect_all(self) -> None:
+        """Attempt to connect to all offline trusted contacts."""
+        if not self._storage or not self._account or not self._config_dir:
+            return
+
+        contacts = await self._storage.list_contacts()
+        for contact in contacts:
+            if contact.peer_id in self._sessions:
+                continue
+            if contact.peer_id in self._connecting:
+                continue
+            if not contact.ygg_address or not contact.trusted:
+                log.debug(
+                    "Skip reconnect %s: ygg=%s trusted=%s",
+                    contact.display_name, bool(contact.ygg_address), contact.trusted,
+                )
+                continue
+            log.info("Reconnecting to %s (%s)", contact.display_name, contact.ygg_address)
+            task = asyncio.create_task(
+                self._try_reconnect_peer(contact.peer_id, contact.ygg_address),
+                name=f"reconnect-{contact.peer_id[:8]}",
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+    async def _try_reconnect_peer(self, peer_id: str, ygg_address: str) -> None:
+        """Attempt to reconnect to a single peer (silent on failure)."""
+        if peer_id in self._sessions or peer_id in self._connecting:
+            return
+        if not self._account or not self._storage or not self._config_dir:
+            return
+
+        self._connecting.add(peer_id)
+        try:
+            from p2pchat.core.network.peer import connect
+            from p2pchat.core.protocol import PORT
+
+            session = await connect(
+                ygg_address,
+                PORT,
+                self._account,
+                self._storage,
+                self._config_dir,
+                # No verify callback — silently reject unknown peers.
+                timeout=8.0,
+            )
+            # Run session lifecycle in background.
+            task = asyncio.create_task(self._on_session_ready(session))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except Exception as exc:
+            log.info("Reconnect to %s failed: %s", peer_id, exc)
+        finally:
+            self._connecting.discard(peer_id)
 
     async def _start_outbox_retries(self) -> None:
         """Start retry loops for all peers with pending outbox items."""
@@ -410,19 +517,29 @@ class ChatApp(App):
 
     async def _cancel_background_tasks(self) -> None:
         """Cancel outbox-initiated session tasks and the network startup task."""
+        # Cancel the reconnect loop.
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+
+        # Cancel all background session / connection tasks.
         pending = [t for t in self._background_tasks if not t.done()]
         for task in pending:
             task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        self._background_tasks.clear()
 
+        # Also cancel the network startup task.
         if self._start_network_task and not self._start_network_task.done():
             self._start_network_task.cancel()
-            try:
-                await self._start_network_task
-            except (asyncio.CancelledError, Exception):
-                pass
+
+        # Await everything together.
+        all_tasks = pending[:]
+        if self._reconnect_task:
+            all_tasks.append(self._reconnect_task)
+        if self._start_network_task:
+            all_tasks.append(self._start_network_task)
+        if all_tasks:
+            await asyncio.gather(*all_tasks, return_exceptions=True)
+
+        self._background_tasks.clear()
 
     async def _cleanup_resources(self) -> None:
         """Clean shutdown of network resources."""
