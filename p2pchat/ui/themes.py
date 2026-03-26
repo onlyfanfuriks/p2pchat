@@ -1,7 +1,7 @@
 """Built-in themes for p2pchat.
 
-Curated color palettes inspired by best practices in terminal UI design.
-Each theme provides a cohesive visual experience across all app components.
+Color palettes adapted from Posting by Darren Burns:
+https://github.com/darrenburns/posting
 """
 
 from textual.theme import Theme as TextualTheme
