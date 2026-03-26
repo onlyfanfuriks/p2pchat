@@ -13,6 +13,7 @@ This module provides a best-effort defense-in-depth layer.
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 _CHUNK = 64 * 1024  # 64 KiB write chunks
@@ -22,16 +23,25 @@ def secure_delete_file(path: Path) -> None:
     """Overwrite *path* with random bytes, truncate, then unlink.
 
     Silently skips files that don't exist or aren't regular files.
+    Uses O_NOFOLLOW and fstat on the fd to avoid TOCTOU races.
     """
     path = Path(path)
-    if not path.is_file():
+
+    # Open with O_NOFOLLOW to refuse symlinks, then check via the fd.
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_NOFOLLOW)
+    except OSError:
+        # File doesn't exist, is a symlink, or can't be opened — skip.
         return
 
-    size = path.stat().st_size
-
-    # Overwrite in chunks to keep memory usage bounded.
-    fd = os.open(str(path), os.O_WRONLY)
     try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return
+
+        size = st.st_size
+
+        # Overwrite in chunks to keep memory usage bounded.
         remaining = size
         while remaining > 0:
             chunk = min(_CHUNK, remaining)

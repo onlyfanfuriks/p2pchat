@@ -7,6 +7,7 @@ and binary-discovery tests manipulate PATH / file system via monkeypatch.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import stat
@@ -933,3 +934,399 @@ class TestFindBinaryEdgeCases:
 
         result = YggdrasilNode.find_binary()
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# TestDetectRunning
+# ---------------------------------------------------------------------------
+
+class TestDetectRunning:
+    async def test_returns_address_on_working_socket(self, tmp_path):
+        """detect_running() returns an address when an admin socket responds."""
+        node = _make_node(tmp_path)
+
+        # Create a fake socket file so .exists() passes.
+        sock_file = node._admin_sock
+        sock_file.touch()
+
+        with patch.object(
+            YggdrasilNode,
+            "_query_admin_address",
+            new_callable=AsyncMock,
+            return_value="200:abcd::1",
+        ):
+            address = await node.detect_running()
+
+        assert address == "200:abcd::1"
+        assert node._external is True
+
+    async def test_returns_none_on_connection_refused(self, tmp_path):
+        """detect_running() returns None when all sockets refuse connections."""
+        node = _make_node(tmp_path)
+
+        # Create the local socket file so .exists() passes.
+        node._admin_sock.touch()
+
+        with patch.object(
+            YggdrasilNode,
+            "_query_admin_address",
+            new_callable=AsyncMock,
+            side_effect=ConnectionRefusedError("stale socket"),
+        ):
+            with patch.object(
+                YggdrasilNode,
+                "_detect_address_from_interfaces",
+                new_callable=AsyncMock,
+                return_value=None,
+            ):
+                address = await node.detect_running()
+
+        assert address is None
+        assert node._external is False
+
+    async def test_returns_none_on_permission_denied(self, tmp_path):
+        """detect_running() returns None when socket is permission denied."""
+        node = _make_node(tmp_path)
+
+        node._admin_sock.touch()
+
+        with patch.object(
+            YggdrasilNode,
+            "_query_admin_address",
+            new_callable=AsyncMock,
+            side_effect=PermissionError("permission denied"),
+        ):
+            with patch.object(
+                YggdrasilNode,
+                "_detect_address_from_interfaces",
+                new_callable=AsyncMock,
+                return_value=None,
+            ):
+                address = await node.detect_running()
+
+        assert address is None
+
+    async def test_falls_back_to_interfaces(self, tmp_path):
+        """detect_running() falls back to interface detection when no sockets work."""
+        node = _make_node(tmp_path)
+        # No socket files exist, so socket probes are skipped entirely.
+
+        with patch.object(
+            YggdrasilNode,
+            "_detect_address_from_interfaces",
+            new_callable=AsyncMock,
+            return_value="200:beef::1",
+        ):
+            address = await node.detect_running()
+
+        assert address == "200:beef::1"
+        assert node._external is True
+
+
+# ---------------------------------------------------------------------------
+# TestQueryAdminAddress
+# ---------------------------------------------------------------------------
+
+class TestQueryAdminAddress:
+    async def test_v5_response_format(self, tmp_path):
+        """_query_admin_address() parses v0.5 admin API response."""
+        v5_data = json.dumps({"response": {"address": "200:1111::1"}}).encode()
+
+        mock_reader = AsyncMock()
+        mock_reader.read = AsyncMock(return_value=v5_data)
+        mock_writer = MagicMock()
+        mock_writer.write = MagicMock()
+        mock_writer.drain = AsyncMock()
+        mock_writer.close = MagicMock()
+        mock_writer.wait_closed = AsyncMock()
+
+        with patch(
+            "p2pchat.core.network.yggdrasil.asyncio.open_unix_connection",
+            new_callable=AsyncMock,
+            return_value=(mock_reader, mock_writer),
+        ):
+            result = await YggdrasilNode._query_admin_address(Path("/fake.sock"))
+
+        assert result == "200:1111::1"
+
+    async def test_v4_fallback_format(self, tmp_path):
+        """_query_admin_address() falls back to v0.4 API format."""
+        v5_empty = json.dumps({"response": {}}).encode()
+        v4_data = json.dumps(
+            {"response": {"self": {"IPv6address": "200:2222::2"}}}
+        ).encode()
+
+        call_count = 0
+
+        async def _mock_connect(path):
+            nonlocal call_count
+            call_count += 1
+            r = AsyncMock()
+            r.read = AsyncMock(
+                return_value=v5_empty if call_count == 1 else v4_data
+            )
+            w = MagicMock()
+            w.write = MagicMock()
+            w.drain = AsyncMock()
+            w.close = MagicMock()
+            w.wait_closed = AsyncMock()
+            return r, w
+
+        with patch(
+            "p2pchat.core.network.yggdrasil.asyncio.open_unix_connection",
+            side_effect=_mock_connect,
+        ):
+            result = await YggdrasilNode._query_admin_address(Path("/fake.sock"))
+
+        assert result == "200:2222::2"
+
+    async def test_returns_none_on_oserror(self):
+        """_query_admin_address() returns None when socket open raises OSError."""
+        with patch(
+            "p2pchat.core.network.yggdrasil.asyncio.open_unix_connection",
+            new_callable=AsyncMock,
+            side_effect=OSError("No such file"),
+        ):
+            result = await YggdrasilNode._query_admin_address(Path("/gone.sock"))
+
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# TestDetectAddressFromInterfaces
+# ---------------------------------------------------------------------------
+
+class TestDetectAddressFromInterfaces:
+    async def test_extracts_yggdrasil_address(self):
+        """_detect_address_from_interfaces() finds a 02xx address from /proc/net/if_inet6."""
+        # /proc/net/if_inet6 format: hex_addr ifindex prefix_len scope flags ifname
+        proc_content = (
+            "fe80000000000000021caa00ff0ebbcc 03 40 20 80    eth0\n"
+            "0200abcdef012345abcdef0123456789 05 07 00 00    tun0\n"
+            "00000000000000000000000000000001 01 80 10 80      lo\n"
+        )
+
+        with patch(
+            "p2pchat.core.network.yggdrasil.asyncio.to_thread",
+            new_callable=AsyncMock,
+            return_value=proc_content,
+        ):
+            result = await YggdrasilNode._detect_address_from_interfaces()
+
+        assert result is not None
+        assert result.startswith("200:")
+
+    async def test_returns_none_when_no_ygg_address(self):
+        """_detect_address_from_interfaces() returns None when no 02xx/03xx address present."""
+        proc_content = (
+            "fe80000000000000021caa00ff0ebbcc 03 40 20 80    eth0\n"
+            "00000000000000000000000000000001 01 80 10 80      lo\n"
+        )
+
+        with patch(
+            "p2pchat.core.network.yggdrasil.asyncio.to_thread",
+            new_callable=AsyncMock,
+            return_value=proc_content,
+        ):
+            result = await YggdrasilNode._detect_address_from_interfaces()
+
+        assert result is None
+
+    async def test_returns_none_on_oserror(self):
+        """_detect_address_from_interfaces() returns None when /proc is unreadable."""
+        with patch(
+            "p2pchat.core.network.yggdrasil.asyncio.to_thread",
+            new_callable=AsyncMock,
+            side_effect=OSError("No such file"),
+        ):
+            result = await YggdrasilNode._detect_address_from_interfaces()
+
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# TestExternalModeStop
+# ---------------------------------------------------------------------------
+
+class TestExternalModeStop:
+    async def test_stop_is_noop_when_external(self, tmp_path):
+        """stop() does nothing when _external=True (no subprocess killed)."""
+        node = _make_node(tmp_path)
+        node._external = True
+
+        # Set up a mock process that should NOT be touched.
+        mock_proc = MagicMock()
+        mock_proc.returncode = None
+        mock_proc.send_signal = MagicMock()
+        mock_proc.wait = AsyncMock()
+        node._process = mock_proc
+
+        await node.stop()
+
+        # Process must not be signalled or waited on.
+        mock_proc.send_signal.assert_not_called()
+        mock_proc.wait.assert_not_called()
+        # _process is NOT cleared in external mode (stop returns early).
+        assert node._process is mock_proc
+
+
+# ---------------------------------------------------------------------------
+# TestDownloadBinaryPathTraversal
+# ---------------------------------------------------------------------------
+
+class TestDownloadBinaryPathTraversal:
+    def test_extractall_uses_data_filter(self, tmp_path):
+        """_extract_deb uses filter='data' to block path traversal in tar members."""
+        import tarfile as tf
+
+        from p2pchat.core.network.yggdrasil import _extract_deb
+
+        # Create a minimal data.tar.gz containing a path-traversal member.
+        ar_dir = tmp_path / "ar_out"
+        ar_dir.mkdir()
+        tar_path = ar_dir / "data.tar.gz"
+
+        with tf.open(tar_path, "w:gz") as tar:
+            # Add a legitimate file.
+            import io
+            data = b"#!/bin/sh\necho hello"
+            info = tf.TarInfo(name="usr/bin/yggdrasil")
+            info.size = len(data)
+            info.mode = 0o755
+            tar.addfile(info, io.BytesIO(data))
+            # Add a malicious path-traversal member.
+            evil_info = tf.TarInfo(name="../../../etc/evil")
+            evil_info.size = 4
+            tar.addfile(evil_info, io.BytesIO(b"pwnd"))
+
+        # Create a fake .deb — _extract_deb uses ar to extract, so we mock that.
+        deb_path = tmp_path / "fake.deb"
+        deb_path.touch()
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+
+        # Mock ar so the fallback tar path is exercised.
+        with patch("p2pchat.core.network.yggdrasil.shutil.which") as mock_which:
+            # No dpkg-deb, but ar exists.
+            mock_which.side_effect = lambda name: None if name == "dpkg-deb" else "/usr/bin/ar"
+
+            with patch("p2pchat.core.network.yggdrasil.subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0)
+
+                # Mock the ar_dir glob to return our crafted tar.
+                with patch("pathlib.Path.glob") as mock_glob:
+                    mock_glob.return_value = iter([tar_path])
+                    with patch("pathlib.Path.mkdir"):
+                        # Verify the tarfile.open call uses filter="data".
+                        with patch("p2pchat.core.network.yggdrasil.tarfile.open") as mock_tf_open:
+                            mock_tar = MagicMock()
+                            mock_tf_open.return_value.__enter__ = MagicMock(return_value=mock_tar)
+                            mock_tf_open.return_value.__exit__ = MagicMock(return_value=False)
+
+                            try:
+                                _extract_deb(deb_path, bin_dir)
+                            except Exception:
+                                pass  # Copy step may fail; we only care about extractall.
+
+                            mock_tar.extractall.assert_called_once()
+                            _, kwargs = mock_tar.extractall.call_args
+                            assert kwargs.get("filter") == "data"
+
+
+# ---------------------------------------------------------------------------
+# TestVerifyDownloadedDeb
+# ---------------------------------------------------------------------------
+
+class TestVerifyDownloadedDeb:
+    def test_hash_match_passes(self, tmp_path):
+        """_verify_downloaded_deb passes when remote checksum matches."""
+        from p2pchat.core.network.yggdrasil import _verify_downloaded_deb
+
+        deb_path = tmp_path / "yggdrasil-0.5.13-amd64.deb"
+        deb_content = b"!<arch>\n" + b"\x00" * 100
+        deb_path.write_bytes(deb_content)
+
+        expected_hash = hashlib.sha256(deb_content).hexdigest()
+        checksums_body = f"{expected_hash}  yggdrasil-0.5.13-amd64.deb\n".encode()
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = checksums_body
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "p2pchat.core.network.yggdrasil.urllib.request.urlopen",
+            return_value=mock_resp,
+        ):
+            # Should not raise.
+            _verify_downloaded_deb(
+                deb_path,
+                "https://github.com/yggdrasil-network/yggdrasil-go/releases/download/v0.5.13/yggdrasil-0.5.13-amd64.deb",
+            )
+
+    def test_hash_mismatch_raises(self, tmp_path):
+        """_verify_downloaded_deb raises RuntimeError on hash mismatch."""
+        from p2pchat.core.network.yggdrasil import _verify_downloaded_deb
+
+        deb_path = tmp_path / "yggdrasil-0.5.13-amd64.deb"
+        deb_path.write_bytes(b"!<arch>\n" + b"\x00" * 100)
+
+        checksums_body = b"0000000000000000000000000000000000000000000000000000000000000000  yggdrasil-0.5.13-amd64.deb\n"
+
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = checksums_body
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch(
+            "p2pchat.core.network.yggdrasil.urllib.request.urlopen",
+            return_value=mock_resp,
+        ):
+            with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
+                _verify_downloaded_deb(
+                    deb_path,
+                    "https://github.com/yggdrasil-network/yggdrasil-go/releases/download/v0.5.13/yggdrasil-0.5.13-amd64.deb",
+                )
+
+    def test_fallback_to_magic_bytes_valid(self, tmp_path):
+        """_verify_downloaded_deb accepts valid ar archive when no checksum available."""
+        from p2pchat.core.network.yggdrasil import _verify_downloaded_deb
+
+        deb_path = tmp_path / "test.deb"
+        # Valid ar magic bytes + enough data to pass minimum size check.
+        deb_path.write_bytes(b"!<arch>\n" + b"\x00" * 100)
+
+        with patch(
+            "p2pchat.core.network.yggdrasil.urllib.request.urlopen",
+            side_effect=Exception("network error"),
+        ):
+            # Should not raise.
+            _verify_downloaded_deb(deb_path, "https://example.com/test.deb")
+
+    def test_fallback_rejects_bad_magic(self, tmp_path):
+        """_verify_downloaded_deb rejects files with wrong magic bytes."""
+        from p2pchat.core.network.yggdrasil import _verify_downloaded_deb
+
+        deb_path = tmp_path / "test.deb"
+        deb_path.write_bytes(b"NOT_AN_ARCHIVE" + b"\x00" * 100)
+
+        with patch(
+            "p2pchat.core.network.yggdrasil.urllib.request.urlopen",
+            side_effect=Exception("network error"),
+        ):
+            with pytest.raises(RuntimeError, match="bad magic bytes"):
+                _verify_downloaded_deb(deb_path, "https://example.com/test.deb")
+
+    def test_fallback_rejects_too_small(self, tmp_path):
+        """_verify_downloaded_deb rejects files that are too small."""
+        from p2pchat.core.network.yggdrasil import _verify_downloaded_deb
+
+        deb_path = tmp_path / "test.deb"
+        deb_path.write_bytes(b"!<arch>\n")  # Only 8 bytes, below _MIN_DEB_SIZE.
+
+        with patch(
+            "p2pchat.core.network.yggdrasil.urllib.request.urlopen",
+            side_effect=Exception("network error"),
+        ):
+            with pytest.raises(RuntimeError, match="too small"):
+                _verify_downloaded_deb(deb_path, "https://example.com/test.deb")

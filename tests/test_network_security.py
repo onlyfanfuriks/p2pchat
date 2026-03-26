@@ -619,3 +619,211 @@ class TestServerClientIntegration:
 
         finally:
             await server.stop()
+
+
+# ---------------------------------------------------------------------------
+# 9. to_id validation — messages addressed to wrong recipient dropped (N-XX)
+# ---------------------------------------------------------------------------
+
+class TestToIdValidation:
+    """After handshake, all messages must have to_id matching the local
+    account's user_id (or be empty). Messages addressed to a different
+    identity must be silently dropped."""
+
+    async def test_wrong_to_id_dropped(self, tmp_path: Path):
+        """A chat message with to_id != local user_id is silently discarded."""
+        alice, bob, alice_acc, _ = await _handshaked_pair(tmp_path)
+
+        # Inject a message addressed to someone else.
+        wrong_recipient = WireMessage(
+            type="chat",
+            from_id=alice_acc.user_id,
+            to_id="someone-elses-id",
+            timestamp=int(time.time() * 1000),
+            message_id=str(uuid.uuid4()),
+            payload={},
+        )
+        await write_message(alice._writer, wrong_recipient)
+        # Follow with a legitimate message so the receive_loop has
+        # something to deliver (acts as sentinel).
+        await alice.send_message("legit")
+
+        received: list[ChatMessage] = []
+
+        async def _collect():
+            async for cm in bob.receive_loop():
+                received.append(cm)
+                break
+
+        await asyncio.wait_for(_collect(), timeout=3.0)
+
+        # Only the legitimate message was delivered.
+        assert len(received) == 1
+        assert received[0].content == "legit"
+
+        await alice.close()
+        await bob.close()
+
+    async def test_empty_to_id_accepted(self, tmp_path: Path):
+        """A message with empty to_id is NOT dropped (backwards compat)."""
+        alice, bob, _, _ = await _handshaked_pair(tmp_path)
+
+        # The to_id check is: ``if msg.to_id and msg.to_id != ...``
+        # An empty string evaluates to False, so the message passes through.
+        # Send a legitimate message (send_message uses the real to_id).
+        await alice.send_message("accepted")
+
+        received: list[ChatMessage] = []
+
+        async def _collect():
+            async for cm in bob.receive_loop():
+                received.append(cm)
+                break
+
+        await asyncio.wait_for(_collect(), timeout=3.0)
+        assert len(received) == 1
+        assert received[0].content == "accepted"
+
+        await alice.close()
+        await bob.close()
+
+    async def test_wrong_to_id_logged(self, tmp_path: Path, caplog):
+        """Dropping a wrong-to_id message emits a WARNING log entry."""
+        alice, bob, alice_acc, _ = await _handshaked_pair(tmp_path)
+
+        wrong_recipient = WireMessage(
+            type="chat",
+            from_id=alice_acc.user_id,
+            to_id="wrong-target",
+            timestamp=int(time.time() * 1000),
+            message_id=str(uuid.uuid4()),
+            payload={},
+        )
+        await write_message(alice._writer, wrong_recipient)
+        # Sentinel.
+        await alice.send_message("after-drop")
+
+        received: list[ChatMessage] = []
+
+        async def _collect():
+            async for cm in bob.receive_loop():
+                received.append(cm)
+                break
+
+        import logging
+        with caplog.at_level(logging.WARNING, logger="p2pchat.core.network.session"):
+            await asyncio.wait_for(_collect(), timeout=3.0)
+
+        assert any("does not match local id" in rec.message for rec in caplog.records)
+        assert len(received) == 1
+
+        await alice.close()
+        await bob.close()
+
+
+# ---------------------------------------------------------------------------
+# 10. Message size limit enforcement (N-XX)
+# ---------------------------------------------------------------------------
+
+class TestMessageSizeLimit:
+    """The wire protocol enforces a MAX_MESSAGE_SIZE (4 MB) on both read and
+    write paths. An attacker who sends a frame header claiming a length
+    exceeding this limit must be rejected without allocating that memory."""
+
+    async def test_oversized_length_header_rejects_on_read(self):
+        """read_message raises ValueError when the 4-byte length exceeds MAX_MESSAGE_SIZE."""
+        import struct
+        from p2pchat.core.protocol import MAX_MESSAGE_SIZE, read_message
+
+        oversized = MAX_MESSAGE_SIZE + 1
+        header = struct.pack(">I", oversized)
+
+        reader = asyncio.StreamReader()
+        reader.feed_data(header)
+        reader.feed_eof()
+
+        with pytest.raises(ValueError, match="MAX_MESSAGE_SIZE"):
+            await read_message(reader)
+
+    async def test_oversized_body_rejects_on_write(self):
+        """write_message raises ValueError when the serialised body exceeds MAX_MESSAGE_SIZE."""
+        from p2pchat.core.protocol import MAX_MESSAGE_SIZE
+
+        # Build a message with a payload large enough to exceed the limit.
+        huge_payload = {"data": "A" * (MAX_MESSAGE_SIZE + 1)}
+        huge_msg = WireMessage(
+            type="chat",
+            from_id="sender",
+            to_id="recipient",
+            timestamp=int(time.time() * 1000),
+            message_id=str(uuid.uuid4()),
+            payload=huge_payload,
+        )
+
+        # We need a real writer; use a socketpair.
+        a, b = socket.socketpair()
+        try:
+            _, writer = await asyncio.open_connection(sock=a)
+            with pytest.raises(ValueError, match="MAX_MESSAGE_SIZE"):
+                await write_message(writer, huge_msg)
+        finally:
+            a.close()
+            b.close()
+
+    async def test_oversized_frame_disconnects_session_gracefully(self, tmp_path: Path):
+        """When a peer sends an oversized frame header, the receive_loop
+        treats it as a connection error and disconnects without crashing.
+        A subsequent valid message on a new session would still work."""
+        alice, bob, _, _ = await _handshaked_pair(tmp_path)
+
+        # Manually write a raw oversized length header onto Alice's writer.
+        # This bypasses write_message's own size check.
+        import struct
+        from p2pchat.core.protocol import MAX_MESSAGE_SIZE
+
+        oversized_header = struct.pack(">I", MAX_MESSAGE_SIZE + 1)
+        # Follow with some dummy bytes (doesn't matter, read_message will
+        # reject before reading the body).
+        alice._writer.write(oversized_header + b"\x00" * 64)
+        await alice._writer.drain()
+
+        received: list[ChatMessage] = []
+
+        async def _collect():
+            async for cm in bob.receive_loop():
+                received.append(cm)
+
+        # The receive loop should exit (the ValueError from read_message is
+        # caught by the ``except (ConnectionError, ValueError)`` handler).
+        await asyncio.wait_for(_collect(), timeout=5.0)
+        assert len(received) == 0
+        assert bob.state == "disconnected"
+
+        await alice.close()
+
+    async def test_zero_length_body_rejected(self):
+        """A frame with length=0 is rejected as invalid."""
+        import struct
+        from p2pchat.core.protocol import read_message
+
+        header = struct.pack(">I", 0)
+        reader = asyncio.StreamReader()
+        reader.feed_data(header)
+        reader.feed_eof()
+
+        with pytest.raises(ValueError, match="zero-length"):
+            await read_message(reader)
+
+    async def test_max_uint32_length_rejected(self):
+        """A frame header claiming 2^32 - 1 bytes is rejected (would be ~4 GB)."""
+        import struct
+        from p2pchat.core.protocol import read_message
+
+        max_u32 = (2**32) - 1
+        header = struct.pack(">I", max_u32)
+        reader = asyncio.StreamReader()
+        reader.feed_data(header)
+        reader.feed_eof()
+
+        with pytest.raises(ValueError, match="MAX_MESSAGE_SIZE"):
+            await read_message(reader)

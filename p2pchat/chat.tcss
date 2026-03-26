@@ -1,6 +1,80 @@
 /* p2pchat — All visual styles */
 
 /* ------------------------------------------------------------------ */
+/* Global defaults                                                     */
+/* ------------------------------------------------------------------ */
+
+* {
+    scrollbar-color: $primary 10%;
+    scrollbar-color-hover: $primary 80%;
+    scrollbar-color-active: $primary;
+    scrollbar-background: $surface-darken-1;
+    scrollbar-background-hover: $surface-darken-1;
+    scrollbar-background-active: $surface-darken-1;
+    scrollbar-size-vertical: 1;
+
+    &:focus {
+        scrollbar-color: $primary 50%;
+    }
+}
+
+Screen {
+    background: $background;
+}
+
+ModalScreen {
+    align: center middle;
+    background: black 30%;
+}
+
+Footer {
+    padding-left: 2;
+}
+
+.hidden {
+    display: none;
+}
+
+/* ------------------------------------------------------------------ */
+/* Buttons                                                             */
+/* ------------------------------------------------------------------ */
+
+Button {
+    padding: 0 2;
+    height: 1;
+    min-width: 10;
+    border: none;
+    margin: 0 1;
+
+    &:hover {
+        border: none;
+        text-style: bold;
+    }
+    &:disabled {
+        opacity: 40%;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Inputs                                                              */
+/* ------------------------------------------------------------------ */
+
+Input {
+    border: none;
+    padding: 0 1;
+    height: 1;
+
+    &:focus {
+        padding-left: 0;
+        border-left: outer $surface-lighten-1;
+
+        &.-invalid {
+            border-left: outer $error;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Status bar                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -9,7 +83,7 @@ StatusBar {
     dock: top;
     background: $panel;
     color: $text-muted;
-    padding: 0 1;
+    padding: 0 2;
 }
 
 StatusBar.status--accent {
@@ -33,23 +107,58 @@ StatusBar.status--success {
 }
 
 /* ------------------------------------------------------------------ */
-/* Main chat layout                                                   */
+/* Chat body (below status bar, above footer)                         */
 /* ------------------------------------------------------------------ */
 
-#main-pane {
+#chat-body {
+    height: 1fr;
+    padding: 0 1;
+}
+
+#chat-content {
     height: 1fr;
 }
 
-#contact-list {
-    width: 24;
-    height: 100%;
-    border-right: tall $surface;
+/* ------------------------------------------------------------------ */
+/* Section — consistent bordered panel (Posting pattern)              */
+/* ------------------------------------------------------------------ */
+
+.section {
+    border: round $accent 40%;
+    background: $surface 30%;
+
+    &:focus-within {
+        border: round $accent;
+    }
 }
+
+/* ------------------------------------------------------------------ */
+/* Contact list  (dock: left — content takes remainder automatically) */
+/* ------------------------------------------------------------------ */
+
+#contact-list {
+    dock: left;
+    width: auto;
+    min-width: 20;
+    max-width: 33%;
+    height: 1fr;
+    padding: 0 1;
+    # border: round $accent 40%;
+
+    # &:focus-within {
+    #     border: round $accent;
+    # }
+}
+
+/* ------------------------------------------------------------------ */
+/* Message list  (fills remaining space after docked sidebar)         */
+/* ------------------------------------------------------------------ */
 
 #message-list {
     width: 1fr;
-    height: 100%;
+    height: 1fr;
     padding: 0 1;
+    scrollbar-size-horizontal: 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -59,9 +168,12 @@ StatusBar.status--success {
 ChatInput {
     dock: bottom;
     height: 3;
-    border-top: tall $accent;
+    border: round $accent 40%;
     padding: 0 1;
-    margin-top: 1;
+
+    &:focus {
+        border: round $accent;
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -69,11 +181,16 @@ ChatInput {
 /* ------------------------------------------------------------------ */
 
 #unlock-box {
-    width: 50;
+    width: 54;
+    max-width: 90%;
     height: auto;
     padding: 2 4;
-    border: round $accent;
+    border: round $accent 50%;
     background: $surface;
+
+    &:focus-within {
+        border: round $accent;
+    }
 }
 
 #app-title {
@@ -83,22 +200,74 @@ ChatInput {
     margin-bottom: 1;
 }
 
+#unlock-box Input {
+    margin-top: 1;
+    height: 3;
+    border: tall $surface-lighten-1;
+    padding: 0 1;
+
+    &:focus {
+        border: tall $accent 60%;
+        padding: 0 1;
+    }
+}
+
+#unlock-box OptionList {
+    margin-top: 1;
+    height: auto;
+    max-height: 12;
+    background: $surface;
+    border: tall $surface-lighten-1;
+
+    &:focus {
+        border: tall $accent 60%;
+    }
+}
+
+#unlock-box Button {
+    margin-top: 1;
+    height: 3;
+    width: 100%;
+    text-style: bold;
+}
+
 #error-label {
     margin-top: 1;
 }
 
 /* ------------------------------------------------------------------ */
-/* Invite modals                                                      */
+/* Modals — shared                                                    */
 /* ------------------------------------------------------------------ */
 
-#invite-dialog, #connect-dialog {
+.modal-body {
+    background: $background;
+    padding: 1 2;
+    width: 50%;
+    height: auto;
+    max-height: 70%;
+    border: wide $background-lighten-2;
+    border-title-color: $text;
+    border-title-background: $background;
+    border-title-style: bold;
+}
+
+/* ------------------------------------------------------------------ */
+/* Invite & verify modals                                             */
+/* ------------------------------------------------------------------ */
+
+#invite-dialog, #connect-dialog, #verify-dialog {
     grid-size: 1;
     grid-gutter: 1;
     padding: 1 2;
-    width: 60;
+    width: 64;
+    max-width: 90%;
     height: auto;
-    border: round $accent;
+    border: round $accent 50%;
     background: $surface;
+
+    &:focus-within {
+        border: round $accent;
+    }
 }
 
 .modal-title {
@@ -110,8 +279,114 @@ ChatInput {
 #invite-text {
     padding: 1;
     background: $panel;
+    border: tall $surface-lighten-1;
 }
 
 #invite-error {
     color: $error;
+}
+
+#invite-dialog Button,
+#connect-dialog Button,
+#verify-dialog Button {
+    margin-top: 0;
+    width: 1fr;
+}
+
+/* ------------------------------------------------------------------ */
+/* Help screen                                                        */
+/* ------------------------------------------------------------------ */
+
+#help-dialog {
+    width: 64;
+    max-width: 90%;
+    max-height: 80%;
+    padding: 1 2;
+    border: round $accent 50%;
+    background: $surface;
+
+    &:focus-within {
+        border: round $accent;
+    }
+}
+
+#help-dialog .help-section-title {
+    text-style: bold;
+    color: $accent;
+    margin-top: 1;
+}
+
+#help-dialog .help-row {
+    height: 1;
+    padding: 0 1;
+}
+
+#help-dialog .help-key {
+    width: 20;
+    color: $text-accent;
+    text-style: bold;
+}
+
+#help-dialog .help-desc {
+    width: 1fr;
+    color: $text;
+}
+
+#help-dialog .help-header {
+    text-style: bold;
+    text-align: center;
+    color: $accent;
+    margin-bottom: 1;
+}
+
+#help-dialog .help-footer {
+    margin-top: 1;
+    text-align: center;
+    color: $text-muted;
+}
+
+/* ------------------------------------------------------------------ */
+/* Command palette                                                    */
+/* ------------------------------------------------------------------ */
+
+CommandPalette {
+    background: black 33%;
+
+    & > Vertical {
+        margin-top: 2;
+        width: 65vw;
+        max-height: 65vh;
+    }
+
+    & #--input {
+        border: none;
+        border-left: wide $accent;
+
+        & CommandInput {
+            height: 3;
+            border: none;
+            padding: 1 2;
+        }
+
+        & SearchIcon {
+            display: none;
+        }
+    }
+
+    & CommandList {
+        border: none;
+        border-left: wide $accent;
+        padding-bottom: 1;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* TextArea defaults                                                   */
+/* ------------------------------------------------------------------ */
+
+TextArea {
+    border: none;
+    &:focus {
+        border: none;
+    }
 }

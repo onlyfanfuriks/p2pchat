@@ -141,10 +141,10 @@ class TestChatScreenMessageReceived:
                 content="hello", timestamp=int(time.time()),
             )
             ml = screen.query_one("#message-list", MessageList)
-            initial_count = len(ml.lines)
+            initial_count = ml.message_count
             await screen.on_message_received("peer1", msg, "Bob")
             await pilot.pause()
-            assert len(ml.lines) > initial_count
+            assert ml.message_count > initial_count
         await storage.close()
 
     async def test_message_for_other_peer_increments_unread(self, tmp_path):
@@ -389,5 +389,5 @@ class TestChatScreenContactSelection:
             await pilot.pause()
             assert screen._selected_peer == "peer1"
             ml = screen.query_one("#message-list", MessageList)
-            assert len(ml.lines) > 0
+            assert ml.message_count > 0
         await storage.close()

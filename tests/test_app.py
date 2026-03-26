@@ -4,7 +4,8 @@ Tests screen transitions, shutdown, and initialization flow.
 """
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -242,11 +243,11 @@ class TestChatAppActionQuit:
 # ---------------------------------------------------------------------------
 
 class TestChatAppStartYggdrasil:
-    async def test_returns_early_without_account(self):
+    async def test_raises_without_account(self):
         app = ChatApp()
         app._account = None
-        await app._start_yggdrasil()
-        # Should not crash
+        with pytest.raises(RuntimeError, match="account or config_dir"):
+            await app._start_yggdrasil()
 
     async def test_returns_early_without_storage_in_chat_server(self):
         app = ChatApp()
@@ -536,3 +537,188 @@ class TestChatAppConnectRequest:
             # Wait for it to finish.
             await asyncio.gather(*app._background_tasks)
             mock_do.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# TestActionDownloadYggdrasil
+# ---------------------------------------------------------------------------
+
+class TestActionDownloadYggdrasil:
+    async def test_already_installed(self):
+        """If binary already found, notify 'already installed' and return."""
+        app = ChatApp()
+        app.notify = MagicMock()
+
+        with patch(
+            "p2pchat.core.network.yggdrasil.YggdrasilNode.find_binary",
+            return_value=Path("/usr/bin/yggdrasil"),
+        ):
+            await app.action_download_yggdrasil()
+
+        calls = [c.args[0] for c in app.notify.call_args_list]
+        assert any("already installed" in c.lower() for c in calls)
+
+    async def test_successful_download(self):
+        """Mock download succeeding, verify 'downloaded' notification."""
+        app = ChatApp()
+        app.notify = MagicMock()
+        app._chat_screen = MagicMock()
+        app._chat_screen.set_status = MagicMock()
+
+        with patch(
+            "p2pchat.core.network.yggdrasil.YggdrasilNode.find_binary",
+            return_value=None,
+        ), patch(
+            "p2pchat.core.network.yggdrasil.YggdrasilNode.download_binary",
+        ) as mock_dl:
+            await app.action_download_yggdrasil()
+
+        mock_dl.assert_called_once()
+        calls = [c.args[0] for c in app.notify.call_args_list]
+        assert any("downloaded" in c.lower() for c in calls)
+
+    async def test_download_failure(self):
+        """Download raises exception, verify error notification."""
+        app = ChatApp()
+        app.notify = MagicMock()
+        app._chat_screen = MagicMock()
+        app._chat_screen.set_status = MagicMock()
+
+        with patch(
+            "p2pchat.core.network.yggdrasil.YggdrasilNode.find_binary",
+            return_value=None,
+        ), patch(
+            "p2pchat.core.network.yggdrasil.YggdrasilNode.download_binary",
+            side_effect=RuntimeError("network error"),
+        ):
+            await app.action_download_yggdrasil()
+
+        calls = [c.kwargs.get("severity", "") for c in app.notify.call_args_list]
+        assert "error" in calls
+
+    async def test_download_triggers_network_start_when_no_address(self):
+        """After successful download, if account has no ygg_address, start network."""
+        app = ChatApp()
+        app.notify = MagicMock()
+        app._chat_screen = MagicMock()
+        app._chat_screen.set_status = MagicMock()
+        account = _make_account()
+        account.ygg_address = ""
+        app._account = account
+        # Ensure _start_network_task looks "done" so a new one is created.
+        app._start_network_task = None
+
+        with patch(
+            "p2pchat.core.network.yggdrasil.YggdrasilNode.find_binary",
+            return_value=None,
+        ), patch(
+            "p2pchat.core.network.yggdrasil.YggdrasilNode.download_binary",
+        ), patch.object(
+            app, "_start_network", new_callable=AsyncMock,
+        ) as mock_start_net:
+            await app.action_download_yggdrasil()
+
+            # A task wrapping _start_network should have been created.
+            assert app._start_network_task is not None
+            await app._start_network_task
+            mock_start_net.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# TestStartYggdrasilFallback
+# ---------------------------------------------------------------------------
+
+class TestStartYggdrasilFallback:
+    def _make_app(self):
+        """Create a ChatApp with account and config_dir set."""
+        app = ChatApp()
+        account = _make_account()
+        account.ygg_conf = '{"PrivateKey": "abc"}'
+        app._account = account
+        app._config_dir = Path("/tmp/test-p2pchat")
+        app._chat_screen = MagicMock()
+        app._chat_screen.set_status = MagicMock()
+        app._chat_screen.query_one = MagicMock()
+        app._password = "testpw"
+        return app
+
+    async def test_subprocess_start_succeeds(self):
+        """detect_running returns None, subprocess start succeeds."""
+        app = self._make_app()
+
+        mock_node = MagicMock()
+        mock_node.detect_running = AsyncMock(return_value=None)
+        mock_node.generate_config = MagicMock(return_value='{"Peers":[]}')
+        mock_node.write_run_conf = MagicMock()
+        mock_node.start = AsyncMock(return_value="200:1111::1")
+        mock_node.stop = AsyncMock()
+
+        with patch(
+            "p2pchat.core.network.yggdrasil.YggdrasilNode",
+            return_value=mock_node,
+        ), patch(
+            "p2pchat.core.network.yggdrasil.YggdrasilNode.find_binary",
+            return_value=Path("/usr/bin/yggdrasil"),
+        ):
+            await app._start_yggdrasil()
+
+        mock_node.detect_running.assert_awaited_once()
+        mock_node.start.assert_awaited_once()
+        assert app._account.ygg_address == "200:1111::1"
+
+    async def test_subprocess_fails_external_found(self):
+        """Subprocess start fails, second detect_running finds external ygg."""
+        app = self._make_app()
+
+        mock_node = MagicMock()
+        # First detect_running: nothing found. Second (after failure): external found.
+        mock_node.detect_running = AsyncMock(
+            side_effect=[None, "200:2222::2"],
+        )
+        mock_node.generate_config = MagicMock(return_value='{"Peers":[]}')
+        mock_node.write_run_conf = MagicMock()
+        mock_node.start = AsyncMock(
+            side_effect=RuntimeError("TUN device busy"),
+        )
+        mock_node.stop = AsyncMock()
+
+        with patch(
+            "p2pchat.core.network.yggdrasil.YggdrasilNode",
+            return_value=mock_node,
+        ), patch(
+            "p2pchat.core.network.yggdrasil.YggdrasilNode.find_binary",
+            return_value=Path("/usr/bin/yggdrasil"),
+        ):
+            await app._start_yggdrasil()
+
+        assert mock_node.detect_running.await_count == 2
+        mock_node.stop.assert_awaited_once()
+        assert app._account.ygg_address == "200:2222::2"
+
+    async def test_complete_failure(self):
+        """Subprocess fails and second detect_running also returns None — raises."""
+        app = self._make_app()
+
+        mock_node = MagicMock()
+        mock_node.detect_running = AsyncMock(
+            side_effect=[None, None],
+        )
+        mock_node.generate_config = MagicMock(return_value='{"Peers":[]}')
+        mock_node.write_run_conf = MagicMock()
+        mock_node.start = AsyncMock(
+            side_effect=RuntimeError("TUN device busy"),
+        )
+        mock_node.stop = AsyncMock()
+
+        with patch(
+            "p2pchat.core.network.yggdrasil.YggdrasilNode",
+            return_value=mock_node,
+        ), patch(
+            "p2pchat.core.network.yggdrasil.YggdrasilNode.find_binary",
+            return_value=Path("/usr/bin/yggdrasil"),
+        ):
+            with pytest.raises(RuntimeError, match="TUN device busy"):
+                await app._start_yggdrasil()
+
+        assert mock_node.detect_running.await_count == 2
+        mock_node.stop.assert_awaited_once()

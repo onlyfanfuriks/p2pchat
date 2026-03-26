@@ -640,6 +640,15 @@ class PeerSession:
                     )
                     continue
 
+                # Validate to_id matches our own identity (drop spoofed messages).
+                if msg.to_id and msg.to_id != self._account.user_id:
+                    log.warning(
+                        "Message to_id %r does not match local id %r; dropping",
+                        msg.to_id,
+                        self._account.user_id,
+                    )
+                    continue
+
                 if msg.type == "bye":
                     log.info(
                         "Peer %s sent bye: %s",

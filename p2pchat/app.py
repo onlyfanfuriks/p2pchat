@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from textual.app import App, ComposeResult
+from textual.command import DiscoveryHit, Hit, Hits, Provider
 from textual.containers import Grid
 from textual.screen import ModalScreen
 from textual.widgets import Button, Label, Static
@@ -26,6 +27,7 @@ _THEME_FILE = ACCOUNT_DIR / "theme.conf"
 from p2pchat.ui.screens.unlock import UnlockScreen
 from p2pchat.ui.screens.chat import ChatScreen, ConnectRequest
 from p2pchat.ui.widgets.invite_modal import InviteInfo
+from p2pchat.ui.themes import BUILTIN_THEMES
 
 if TYPE_CHECKING:
     from p2pchat.core.network.session import PeerSession
@@ -65,14 +67,41 @@ class _VerifyModal(ModalScreen[bool]):
         self.dismiss(event.button.id == "trust")
 
 
+class _AppCommands(Provider):
+    """Command palette entries for p2pchat."""
+
+    @property
+    def _commands(self) -> list[tuple[str, object, str]]:
+        return [
+            ("Download Yggdrasil",
+             self.app.action_download_yggdrasil,
+             "Download Yggdrasil binary to ~/.config/p2pchat/bin/"),
+        ]
+
+    async def discover(self) -> Hits:
+        for name, callback, help_text in self._commands:
+            yield DiscoveryHit(name, callback, help=help_text)
+
+    async def search(self, query: str) -> Hits:
+        matcher = self.matcher(query)
+        for name, callback, help_text in self._commands:
+            score = matcher.match(name)
+            if score > 0:
+                yield Hit(score, matcher.highlight(name), callback, help=help_text)
+
+
 class ChatApp(App):
     """p2pchat terminal application."""
 
     CSS_PATH = "chat.tcss"
     TITLE = "p2pchat"
+    COMMANDS = App.COMMANDS | {_AppCommands}
 
     def __init__(self) -> None:
         super().__init__()
+        # Register custom built-in themes.
+        for theme in BUILTIN_THEMES.values():
+            self.register_theme(theme)
         self._account: Account | None = None
         self._storage: Storage | None = None
         self._config_dir: Path | None = None
@@ -180,43 +209,69 @@ class ChatApp(App):
         )
 
     async def _start_yggdrasil(self) -> None:
-        """Start Yggdrasil subprocess and obtain IPv6 address."""
+        """Start Yggdrasil subprocess or attach to a running instance.
+
+        Strategy:
+        1. Probe for an already-running Yggdrasil (admin socket / interfaces).
+        2. If none found, start our own subprocess.
+        3. If the subprocess fails, probe once more (it may have failed
+           because a system instance owns the TUN device).
+        """
         if self._account is None or self._config_dir is None:
-            return
+            log.error(
+                "_start_yggdrasil: precondition failed — account=%s config_dir=%s",
+                self._account,
+                self._config_dir,
+            )
+            raise RuntimeError(
+                "_start_yggdrasil: account or config_dir is None"
+            )
 
         from p2pchat.core.account import ACCOUNT_DIR
         from p2pchat.core.network.yggdrasil import YggdrasilNode
 
         self._config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
-        # Auto-download Yggdrasil if not found (binary is shared across accounts).
-        if YggdrasilNode.find_binary(ACCOUNT_DIR) is None:
-            if self._chat_screen:
-                self._chat_screen.set_status("downloading yggdrasil\u2026", "accent")
-            await asyncio.to_thread(
-                YggdrasilNode.download_binary, ACCOUNT_DIR,
-            )
-
         node = YggdrasilNode(self._config_dir)
         self._ygg_node = node
 
-        # Write runtime config.
-        conf_json = node.generate_config(
-            self._account.ygg_conf or None
-        )
-        conf_path = self._config_dir / "ygg_run.conf"
-        node.write_run_conf(conf_json, conf_path)
+        # --- Try to attach to already-running Yggdrasil ---
+        address = await node.detect_running()
 
-        # If this is first run, save the ygg config back to the account
-        # so the Yggdrasil identity (and IPv6 address) persists across restarts.
-        if not self._account.ygg_conf:
-            self._account.ygg_conf = conf_json
-            if self._password:
-                await asyncio.to_thread(self._account.save, self._password)
-                self._password = None
-                log.info("Saved ygg config to account")
+        if address is None:
+            # No running instance — start our own subprocess.
+            if YggdrasilNode.find_binary(ACCOUNT_DIR) is None:
+                raise FileNotFoundError(
+                    "Yggdrasil not found \u2014 install it or Ctrl+P \u2192 Download"
+                )
 
-        address = await node.start(conf_path)
+            conf_json = node.generate_config(
+                self._account.ygg_conf or None
+            )
+            conf_path = self._config_dir / "ygg_run.conf"
+            node.write_run_conf(conf_json, conf_path)
+
+            # Save config on first run so Yggdrasil identity persists.
+            if not self._account.ygg_conf:
+                self._account.ygg_conf = conf_json
+                if self._password:
+                    await asyncio.to_thread(self._account.save, self._password)
+                    log.info("Saved ygg config to account")
+
+            try:
+                address = await node.start(conf_path)
+            except (RuntimeError, OSError) as exc:
+                log.warning(
+                    "Subprocess failed (%s); probing for system instance\u2026",
+                    exc,
+                )
+                # Kill any partially-started subprocess.
+                await node.stop()
+                # Retry detection — maybe system Ygg owns the TUN.
+                address = await node.detect_running()
+                if address is None:
+                    raise
+
         self._account.ygg_address = address
 
         # Update chat screen status bar with address.
@@ -368,7 +423,7 @@ class ChatApp(App):
 
         log.info("Verify peer: %s (%s) fingerprint=%s", peer_id, display_name, fingerprint)
 
-        future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
 
         def _on_result(accepted: bool | None) -> None:
             log.info("Verify peer result: %s (%s) accepted=%s", peer_id, display_name, accepted)
@@ -572,3 +627,32 @@ class ChatApp(App):
     async def action_quit(self) -> None:
         await self._cleanup_resources()
         self.exit()
+
+    async def action_download_yggdrasil(self) -> None:
+        """Download Yggdrasil binary and retry network startup."""
+        from p2pchat.core.account import ACCOUNT_DIR
+        from p2pchat.core.network.yggdrasil import YggdrasilNode
+
+        if YggdrasilNode.find_binary(ACCOUNT_DIR) is not None:
+            self.notify("Yggdrasil is already installed")
+            return
+
+        if self._chat_screen:
+            self._chat_screen.set_status("downloading yggdrasil\u2026", "accent")
+
+        try:
+            await asyncio.to_thread(YggdrasilNode.download_binary, ACCOUNT_DIR)
+            self.notify("Yggdrasil downloaded")
+        except Exception as exc:
+            log.error("Yggdrasil download failed: %s", exc)
+            self.notify(f"Download failed: {exc}", severity="error")
+            if self._chat_screen:
+                self._chat_screen.set_status("download failed", "error")
+            return
+
+        # Retry network startup if not connected yet.
+        if self._account and not self._account.ygg_address:
+            if self._start_network_task is None or self._start_network_task.done():
+                self._start_network_task = asyncio.create_task(
+                    self._start_network()
+                )

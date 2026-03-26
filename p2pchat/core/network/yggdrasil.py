@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import hashlib
 import ipaddress
 import json
 import logging
@@ -45,6 +46,14 @@ PUBLIC_PEERS: list[str] = [
     "tcp://satori.nadeko.net:44441",
     # US
     "tls://ygg8.mk16.de:1338",
+]
+
+# Well-known admin socket paths for system-installed Yggdrasil.
+SYSTEM_ADMIN_SOCKETS: list[Path] = [
+    Path("/var/run/yggdrasil/yggdrasil.sock"),
+    Path("/run/yggdrasil/yggdrasil.sock"),
+    Path("/var/run/yggdrasil.sock"),
+    Path("/run/yggdrasil.sock"),
 ]
 
 # Regex that matches Yggdrasil IPv6 addresses in log/stdout output.
@@ -95,14 +104,74 @@ class YggdrasilNode:
     def __init__(self, config_dir: Path) -> None:
         self._config_dir = config_dir
         self._process: asyncio.subprocess.Process | None = None
+        self._external: bool = False
 
         # N-04: Admin socket lives inside config_dir, not world-writable /tmp.
         self._admin_sock = config_dir / "ygg.sock"
         self._admin_listen_uri = f"unix://{self._admin_sock}"
 
+    @property
+    def is_external(self) -> bool:
+        """True when attached to an externally-managed Yggdrasil."""
+        return self._external
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    async def detect_running(self) -> str | None:
+        """Probe admin sockets and network interfaces for a running Yggdrasil.
+
+        Checks the local app socket, well-known system paths, and finally
+        network interfaces for a ``0200::/7`` address.
+
+        If found, switches to *external* mode: :meth:`stop` becomes a
+        no-op and :meth:`get_address` uses the discovered socket.
+
+        Returns
+        -------
+        str or None
+            The Yggdrasil IPv6 address, or ``None`` if not found.
+        """
+        # Probe admin sockets (local first, then system).
+        candidates = [self._admin_sock] + SYSTEM_ADMIN_SOCKETS
+        seen: set[str] = set()
+
+        for sock_path in candidates:
+            key = str(sock_path)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if not sock_path.exists():
+                continue
+
+            try:
+                address = await self._query_admin_address(sock_path)
+            except Exception as exc:
+                log.debug("Admin probe %s failed: %s", sock_path, exc)
+                continue
+
+            if address is not None:
+                log.info(
+                    "Detected running Yggdrasil via %s (address=%s)",
+                    sock_path,
+                    address,
+                )
+                self._admin_sock = sock_path
+                self._external = True
+                return address
+
+        # Fallback: look for a Yggdrasil address on network interfaces.
+        address = await self._detect_address_from_interfaces()
+        if address is not None:
+            log.info(
+                "Found Yggdrasil address %s via network interface", address
+            )
+            self._external = True
+            return address
+
+        return None
 
     async def start(self, conf_path: Path) -> str:
         """Start the Yggdrasil subprocess and return its IPv6 address.
@@ -154,7 +223,12 @@ class YggdrasilNode:
         """Stop the Yggdrasil subprocess gracefully.
 
         Sends SIGTERM, waits up to 3 seconds, then SIGKILL.
+        Does nothing when attached to an external instance.
         """
+        if self._external:
+            log.info("External Yggdrasil — skipping stop")
+            return
+
         if self._process is None:
             return
 
@@ -393,6 +467,9 @@ class YggdrasilNode:
                     f"Failed to download Yggdrasil from {url}: {exc}"
                 ) from exc
 
+            # SEC: Verify integrity of downloaded .deb before extraction.
+            _verify_downloaded_deb(deb_path, url)
+
             # Extract binaries from .deb (ar archive containing data.tar.*).
             _extract_deb(deb_path, bin_dir)
 
@@ -515,6 +592,82 @@ class YggdrasilNode:
     # Private helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    async def _query_admin_address(sock_path: Path) -> str | None:
+        """Query a single admin socket for the node's IPv6 address.
+
+        Returns the address string or ``None`` on any failure.
+        """
+        request_v5 = json.dumps({"request": "getself"}).encode() + b"\n"
+        request_v4 = json.dumps(
+            {"keepalive": True, "request": "self"}
+        ).encode() + b"\n"
+
+        for request in (request_v5, request_v4):
+            try:
+                reader, writer = await asyncio.open_unix_connection(
+                    str(sock_path)
+                )
+            except OSError:
+                return None
+
+            try:
+                writer.write(request)
+                await writer.drain()
+                raw = await asyncio.wait_for(reader.read(65536), timeout=3.0)
+            except Exception:
+                return None
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            address = YggdrasilNode._extract_address_from_response(data)
+            if address is not None:
+                return address
+
+        return None
+
+    @staticmethod
+    async def _detect_address_from_interfaces() -> str | None:
+        """Scan network interfaces for a Yggdrasil address (``0200::/7``).
+
+        Reads ``/proc/net/if_inet6`` (Linux-only) and returns the first
+        address whose first byte is ``0x02`` or ``0x03``.
+        """
+        try:
+            text = await asyncio.to_thread(
+                Path("/proc/net/if_inet6").read_text
+            )
+        except OSError:
+            return None
+
+        for line in text.splitlines():
+            parts = line.split()
+            if not parts or len(parts[0]) != 32:
+                continue
+            hex_addr = parts[0]
+            first_byte = int(hex_addr[:2], 16)
+            if first_byte not in (0x02, 0x03):
+                continue
+            formatted = ":".join(
+                hex_addr[i : i + 4] for i in range(0, 32, 4)
+            )
+            try:
+                addr = ipaddress.IPv6Address(formatted)
+                return str(addr)
+            except ValueError:
+                continue
+
+        return None
+
     async def _wait_for_address(self) -> str:
         """Read stdout and stderr concurrently until an IPv6 address is found.
 
@@ -616,6 +769,70 @@ class YggdrasilNode:
 # Module-level helpers
 # -------------------------------------------------------------------------
 
+_DEB_MAGIC = b"!<arch>\n"  # ar archive magic bytes
+_MIN_DEB_SIZE = 64  # Minimum plausible .deb size in bytes
+
+
+def _verify_downloaded_deb(deb_path: Path, base_url: str) -> None:
+    """Verify integrity of a downloaded .deb file.
+
+    Attempts to fetch a SHA256 checksum from the GitHub release.  If the
+    checksum file is unavailable, falls back to validating the ar-archive
+    magic bytes so that corrupt or truncated downloads are caught before
+    extraction.
+
+    Raises
+    ------
+    RuntimeError
+        If the file fails integrity checks.
+    """
+    file_bytes = deb_path.read_bytes()
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    deb_name = deb_path.name
+
+    # Try fetching a checksums file from the same release directory.
+    # Yggdrasil releases publish a "checksums.txt" with SHA-256 hashes.
+    checksums_url = base_url.rsplit("/", 1)[0] + "/checksums.txt"
+    expected_hash: str | None = None
+    try:
+        with urllib.request.urlopen(checksums_url, timeout=15) as resp:
+            for line in resp.read().decode(errors="replace").splitlines():
+                # Format: "<hex_hash>  <filename>" or "<hex_hash> <filename>"
+                parts = line.split()
+                if len(parts) >= 2 and parts[-1] == deb_name:
+                    expected_hash = parts[0].lower()
+                    break
+    except Exception:
+        log.debug("Could not fetch checksums from %s", checksums_url)
+
+    if expected_hash is not None:
+        if file_hash != expected_hash:
+            raise RuntimeError(
+                f"SHA-256 mismatch for {deb_name}: "
+                f"expected {expected_hash}, got {file_hash}. "
+                "The download may be corrupted or tampered with."
+            )
+        log.info("SHA-256 verified for %s", deb_name)
+        return
+
+    # Fallback: no remote checksum available — validate archive structure.
+    log.warning(
+        "No SHA-256 checksum available for %s; "
+        "verifying archive magic bytes only.",
+        deb_name,
+    )
+    if len(file_bytes) < _MIN_DEB_SIZE:
+        raise RuntimeError(
+            f"Downloaded file too small ({len(file_bytes)} bytes); "
+            "not a valid .deb package."
+        )
+    if not file_bytes.startswith(_DEB_MAGIC):
+        raise RuntimeError(
+            "Downloaded file is not a valid .deb archive "
+            "(bad magic bytes). Expected ar archive header."
+        )
+
+
 def _extract_deb(deb_path: Path, bin_dir: Path) -> None:
     """Extract yggdrasil and yggdrasilctl from a .deb package.
 
@@ -653,7 +870,9 @@ def _extract_deb(deb_path: Path, bin_dir: Path) -> None:
         if data_tar is None:
             raise RuntimeError("No data.tar.* found in .deb archive")
         with tarfile.open(data_tar) as tf:
-            tf.extractall(extract_dir)
+            # SEC: filter="data" (Python 3.12+) blocks path-traversal
+            # entries (e.g. "../evil"), symlinks, and device files.
+            tf.extractall(extract_dir, filter="data")
 
     # Copy binaries to bin_dir.
     for name in ("yggdrasil", "yggdrasilctl"):

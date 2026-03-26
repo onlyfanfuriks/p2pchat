@@ -9,6 +9,7 @@ from __future__ import annotations
 import ipaddress
 import re
 from typing import NamedTuple
+from urllib.parse import quote, unquote
 
 from textual import on
 from textual.app import ComposeResult
@@ -63,14 +64,14 @@ def parse_invite(link: str) -> InviteInfo:
         ygg_address=addr_str,
         port=port,
         ed25519_pub=pub_bytes,
-        display_name=name or "",
+        display_name=unquote(name) if name else "",
     )
 
 
 def build_invite(ygg_address: str, port: int, ed25519_pub_b64: str, display_name: str) -> str:
     """Build an invite link string."""
-    safe_name = display_name.replace("#", "")
-    return f"p2pchat://[{ygg_address}]:{port}/{ed25519_pub_b64}#{safe_name}"
+    encoded_name = quote(display_name, safe="")
+    return f"p2pchat://[{ygg_address}]:{port}/{ed25519_pub_b64}#{encoded_name}"
 
 
 class ShowInviteModal(ModalScreen[None]):

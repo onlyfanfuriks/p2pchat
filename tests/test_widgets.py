@@ -12,7 +12,9 @@ from p2pchat.ui.screens.contacts import ContactList
 from p2pchat.ui.widgets.chat_input import ChatInput
 from p2pchat.ui.widgets.message_list import (
     MessageList,
+    _delivery_indicator,
     _format_timestamp,
+    _theme_colors,
 )
 from p2pchat.ui.widgets.status_bar import StatusBar
 
@@ -48,7 +50,8 @@ class TestDeliveryIndicator:
         async with TestApp().run_test() as pilot:
             ml = pilot.app.query_one("#ml", MessageList)
             msg = Message(peer_id="x", direction="received", content="hi", timestamp=0)
-            assert ml._delivery_indicator(msg) == ""
+            c = _theme_colors(ml)
+            assert _delivery_indicator(msg, c) == ""
 
     async def test_sent_delivered(self):
         class TestApp(App):
@@ -61,7 +64,8 @@ class TestDeliveryIndicator:
                 peer_id="x", direction="sent", content="hi",
                 timestamp=0, delivered=True,
             )
-            result = ml._delivery_indicator(msg)
+            c = _theme_colors(ml)
+            result = _delivery_indicator(msg, c)
             assert "\u2713" in str(result)  # checkmark
 
     async def test_sent_undelivered(self):
@@ -75,7 +79,8 @@ class TestDeliveryIndicator:
                 peer_id="x", direction="sent", content="hi",
                 timestamp=0, delivered=False,
             )
-            result = ml._delivery_indicator(msg)
+            c = _theme_colors(ml)
+            result = _delivery_indicator(msg, c)
             assert "\u23f3" in str(result)  # hourglass
 
 
@@ -107,7 +112,7 @@ class TestStatusBar:
             sb.ygg_address = "200:abcd::1"
             rendered = sb.render()
             assert "Alice" in rendered
-            assert "[200:abcd::1]" in rendered
+            assert "200:abcd::1" in rendered
 
     async def test_set_status_accent(self):
         class TestApp(App):
@@ -142,6 +147,41 @@ class TestStatusBar:
             sb.set_status("ready", "default")
             assert not sb.has_class("status--error")
             assert not sb.has_class("status--accent")
+
+    async def test_rich_markup_in_display_name_escaped(self):
+        """Display name with Rich markup tags is escaped, not interpreted."""
+        class TestApp(App):
+            def compose(self) -> ComposeResult:
+                yield StatusBar(id="sb")
+
+        async with TestApp().run_test() as pilot:
+            sb = pilot.app.query_one("#sb", StatusBar)
+            sb.display_name = "[bold red]EVIL[/]"
+            rendered = sb.render()
+            # The literal markup should appear escaped (not stripped by Rich).
+            assert "[bold red]" not in rendered or "\\[bold red]" in rendered or "\\[bold red\\]" in rendered
+            # The escaped name must still be present in the output.
+            assert "EVIL" in rendered
+
+    async def test_special_characters_in_display_name(self):
+        """Special chars (brackets, backslashes, ampersands) don't break rendering."""
+        class TestApp(App):
+            def compose(self) -> ComposeResult:
+                yield StatusBar(id="sb")
+
+        special_names = [
+            "[link=http://evil.com]click me[/link]",
+            "name\\with\\backslashes",
+            "O'Brien & friends <team>",
+            "[/bold][red]injection[/red]",
+        ]
+        async with TestApp().run_test() as pilot:
+            sb = pilot.app.query_one("#sb", StatusBar)
+            for name in special_names:
+                sb.display_name = name
+                rendered = sb.render()
+                # Must not raise and must still contain the base text.
+                assert "p2pchat" in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +294,7 @@ class TestMessageList:
             )
             ml.add_chat_message(msg)
             await pilot.pause()
-            # After render, lines should contain the written content.
-            assert len(ml.lines) > 0
+            assert ml.message_count > 0
 
     async def test_add_chat_message_received(self):
         class TestApp(App):
@@ -270,7 +309,7 @@ class TestMessageList:
             )
             ml.add_chat_message(msg, "Bob")
             await pilot.pause()
-            assert len(ml.lines) > 0
+            assert ml.message_count > 0
 
     async def test_load_history_clears_and_reloads(self):
         class TestApp(App):
@@ -285,11 +324,11 @@ class TestMessageList:
             ]
             ml.load_history(msgs, "Peer")
             await pilot.pause()
-            count_first = len(ml.lines)
+            count_first = ml.message_count
             # Reload should clear and re-add with fewer messages.
             ml.load_history(msgs[:2], "Peer")
             await pilot.pause()
-            assert len(ml.lines) < count_first
+            assert ml.message_count < count_first
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +385,7 @@ class TestContactList:
             contacts = self._make_contacts(1)
             cl.set_contacts(contacts, unread={"peer0": 5})
             opt = cl.get_option_at_index(0)
-            assert "[5]" in str(opt.prompt)
+            assert "5" in str(opt.prompt)
 
     async def test_mark_online_offline(self):
         class TestApp(App):
@@ -376,10 +415,36 @@ class TestContactList:
             cl.increment_unread("peer0")
             cl.increment_unread("peer0")
             opt = cl.get_option_at_index(0)
-            assert "[2]" in str(opt.prompt)
+            assert "2" in str(opt.prompt)
             cl.clear_unread("peer0")
             opt = cl.get_option_at_index(0)
-            assert "[" not in str(opt.prompt)
+            assert "\u2709" not in str(opt.prompt)
+
+    async def test_increment_unread_does_not_rebuild(self):
+        """increment_unread updates only the affected item, not the full list."""
+        class TestApp(App):
+            def compose(self) -> ComposeResult:
+                yield ContactList(id="cl")
+
+        async with TestApp().run_test() as pilot:
+            cl = pilot.app.query_one("#cl", ContactList)
+            contacts = self._make_contacts(3)
+            cl.set_contacts(contacts)
+
+            # Spy on _rebuild to ensure it is NOT called by increment_unread.
+            from unittest.mock import patch as mock_patch
+            with mock_patch.object(cl, "_rebuild", wraps=cl._rebuild) as mock_rebuild:
+                cl.increment_unread("peer1")
+                mock_rebuild.assert_not_called()
+
+            # The badge should still appear on the correct item.
+            opt1 = cl.get_option_at_index(1)
+            assert "1" in str(opt1.prompt)
+            # Other items should be unaffected (no badge).
+            opt0 = cl.get_option_at_index(0)
+            assert "\u2709" not in str(opt0.prompt)
+            opt2 = cl.get_option_at_index(2)
+            assert "\u2709" not in str(opt2.prompt)
 
     async def test_selected_message_posted(self):
         selected_peers = []

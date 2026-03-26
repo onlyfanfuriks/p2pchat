@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import socket
 import time
 import uuid
@@ -17,7 +18,12 @@ from p2pchat.core.crypto import (
     generate_ed25519_keypair,
     generate_x25519_keypair,
 )
-from p2pchat.core.network.session import ChatMessage, PeerSession
+from p2pchat.core.network.session import (
+    ChatMessage,
+    PeerSession,
+    _PING_INTERVAL,
+    _PONG_TIMEOUT,
+)
 from p2pchat.core.protocol import WireMessage, write_message
 from p2pchat.core.storage import Contact, Storage, derive_db_key
 
@@ -732,3 +738,310 @@ class TestVerifyCallbackEdgeCases:
 
         errors = [r for r in results if isinstance(r, (ConnectionRefusedError, ConnectionError))]
         assert len(errors) >= 1
+
+
+# ---------------------------------------------------------------------------
+# TestKeepaliveTimeout
+# ---------------------------------------------------------------------------
+
+class TestKeepaliveTimeout:
+    """Tests for the ping/pong keepalive mechanism and timeout disconnection."""
+
+    async def _setup(self, tmp_path: Path) -> tuple[PeerSession, PeerSession]:
+        alice_acc = _make_account("Alice")
+        bob_acc = _make_account("Bob")
+        alice_store = await _make_storage(tmp_path / "a", alice_acc)
+        bob_store = await _make_storage(tmp_path / "b", bob_acc)
+        accept = AsyncMock(return_value=True)
+
+        (ar, aw), (br, bw) = await make_stream_pair()
+        alice = PeerSession(ar, aw, alice_acc, alice_store, is_initiator=True, verify_callback=accept)
+        bob = PeerSession(br, bw, bob_acc, bob_store, is_initiator=False, verify_callback=accept)
+        await asyncio.gather(*[_full_handshake(alice), _full_handshake(bob)])
+        return alice, bob
+
+    async def test_pong_timeout_disconnects(self, tmp_path: Path):
+        """Session disconnects when pong is not received within timeout."""
+        alice, bob = await self._setup(tmp_path)
+
+        # Patch _PING_INTERVAL and _PONG_TIMEOUT to small values for fast test.
+        # The receive_loop read timeout is _PING_INTERVAL + _PONG_TIMEOUT + 5.0,
+        # so we need the outer wait_for to exceed that (0.1 + 0.1 + 5.0 = 5.2s).
+        with patch("p2pchat.core.network.session._PING_INTERVAL", 0.1), \
+             patch("p2pchat.core.network.session._PONG_TIMEOUT", 0.1):
+
+            received: list[ChatMessage] = []
+
+            async def _collect():
+                async for cm in alice.receive_loop():
+                    received.append(cm)
+
+            # Alice's receive_loop sends pings. Bob's side does NOT have
+            # a receive_loop running, so Bob will never send a pong back.
+            # Alice should disconnect after pong timeout.
+            await asyncio.wait_for(_collect(), timeout=8.0)
+
+        assert alice.state == "disconnected"
+        await bob.close()
+
+    async def test_keepalive_sent_on_schedule(self, tmp_path: Path):
+        """Ping is sent after the idle interval elapses."""
+        alice, bob = await self._setup(tmp_path)
+
+        with patch("p2pchat.core.network.session._PING_INTERVAL", 0.1), \
+             patch("p2pchat.core.network.session._PONG_TIMEOUT", 2.0):
+
+            received_bob: list[ChatMessage] = []
+
+            # Bob's receive_loop will auto-respond to pings with pongs.
+            async def _collect_bob():
+                async for cm in bob.receive_loop():
+                    received_bob.append(cm)
+
+            bob_task = asyncio.create_task(_collect_bob())
+
+            # Track pings sent by Alice's keepalive loop via _send_ping.
+            original_send_ping = alice._send_ping
+            ping_count = 0
+
+            async def _counting_ping():
+                nonlocal ping_count
+                ping_count += 1
+                await original_send_ping()
+
+            alice._send_ping = _counting_ping
+
+            received_alice: list[ChatMessage] = []
+
+            async def _collect_alice():
+                async for cm in alice.receive_loop():
+                    received_alice.append(cm)
+
+            alice_task = asyncio.create_task(_collect_alice())
+
+            # Wait long enough for at least 2 ping cycles (0.1s interval).
+            await asyncio.sleep(0.4)
+
+            assert ping_count >= 2, f"Expected >= 2 pings sent, got {ping_count}"
+            assert alice.state == "active"
+
+            await alice.close()
+            await bob.close()
+            for t in (alice_task, bob_task):
+                try:
+                    await asyncio.wait_for(t, timeout=3.0)
+                except Exception:
+                    t.cancel()
+
+    async def test_keepalive_resets_on_message_sent(self, tmp_path: Path):
+        """Sending a chat message resets the keepalive timer so no ping is needed."""
+        alice, bob = await self._setup(tmp_path)
+
+        with patch("p2pchat.core.network.session._PING_INTERVAL", 0.3), \
+             patch("p2pchat.core.network.session._PONG_TIMEOUT", 2.0):
+
+            received_bob: list[ChatMessage] = []
+
+            async def _collect_bob():
+                async for cm in bob.receive_loop():
+                    received_bob.append(cm)
+
+            bob_task = asyncio.create_task(_collect_bob())
+
+            original_send_ping = alice._send_ping
+            ping_count = 0
+
+            async def _counting_ping():
+                nonlocal ping_count
+                ping_count += 1
+                await original_send_ping()
+
+            alice._send_ping = _counting_ping
+
+            received_alice: list[ChatMessage] = []
+
+            async def _collect_alice():
+                async for cm in alice.receive_loop():
+                    received_alice.append(cm)
+
+            alice_task = asyncio.create_task(_collect_alice())
+
+            # Send messages faster than the ping interval to suppress pings.
+            for _ in range(5):
+                await alice.send_message("keep alive")
+                await asyncio.sleep(0.1)
+
+            # No pings should have been needed since we kept sending messages.
+            assert ping_count == 0, f"Expected 0 pings (messages reset timer), got {ping_count}"
+
+            await alice.close()
+            await bob.close()
+            for t in (alice_task, bob_task):
+                try:
+                    await asyncio.wait_for(t, timeout=3.0)
+                except Exception:
+                    t.cancel()
+
+    async def test_pong_response_keeps_session_alive(self, tmp_path: Path):
+        """Receiving a pong keeps the session from disconnecting."""
+        alice, bob = await self._setup(tmp_path)
+
+        with patch("p2pchat.core.network.session._PING_INTERVAL", 0.1), \
+             patch("p2pchat.core.network.session._PONG_TIMEOUT", 2.0):
+
+            received_alice: list[ChatMessage] = []
+            received_bob: list[ChatMessage] = []
+
+            async def _collect_alice():
+                async for cm in alice.receive_loop():
+                    received_alice.append(cm)
+
+            async def _collect_bob():
+                async for cm in bob.receive_loop():
+                    received_bob.append(cm)
+
+            alice_task = asyncio.create_task(_collect_alice())
+            bob_task = asyncio.create_task(_collect_bob())
+
+            # Let both loops run. Bob's loop responds to pings with pongs.
+            # Wait long enough for multiple ping/pong cycles.
+            await asyncio.sleep(0.5)
+
+            # Both sessions should still be active (pongs kept them alive).
+            assert alice.state == "active"
+            assert bob.state == "active"
+
+            # Clean shutdown.
+            await alice.close()
+            await bob.close()
+            try:
+                await asyncio.wait_for(alice_task, timeout=3.0)
+            except Exception:
+                alice_task.cancel()
+            try:
+                await asyncio.wait_for(bob_task, timeout=3.0)
+            except Exception:
+                bob_task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# TestUnknownMessageType
+# ---------------------------------------------------------------------------
+
+class TestUnknownMessageType:
+    """Tests for receiving messages with unknown/unrecognized type."""
+
+    async def _setup(self, tmp_path: Path) -> tuple[PeerSession, PeerSession, Account, Account]:
+        alice_acc = _make_account("Alice")
+        bob_acc = _make_account("Bob")
+        alice_store = await _make_storage(tmp_path / "a", alice_acc)
+        bob_store = await _make_storage(tmp_path / "b", bob_acc)
+        accept = AsyncMock(return_value=True)
+
+        (ar, aw), (br, bw) = await make_stream_pair()
+        alice = PeerSession(ar, aw, alice_acc, alice_store, is_initiator=True, verify_callback=accept)
+        bob = PeerSession(br, bw, bob_acc, bob_store, is_initiator=False, verify_callback=accept)
+        await asyncio.gather(*[_full_handshake(alice), _full_handshake(bob)])
+        return alice, bob, alice_acc, bob_acc
+
+    async def test_unknown_type_does_not_crash(self, tmp_path: Path):
+        """Receiving a message with unknown type does not crash the session."""
+        alice, bob, alice_acc, bob_acc = await self._setup(tmp_path)
+
+        # Inject a message with an unknown type directly on the wire.
+        unknown = WireMessage(
+            type="unknown_fancy_type",
+            from_id=alice_acc.user_id,
+            to_id=bob_acc.user_id,
+            timestamp=int(time.time() * 1000),
+            message_id=str(uuid.uuid4()),
+            payload={"data": "something"},
+        )
+        await write_message(alice._writer, unknown)
+
+        # Follow with a legitimate message to confirm the loop is still alive.
+        await alice.send_message("after unknown")
+
+        received: list[ChatMessage] = []
+
+        async def _collect():
+            async for cm in bob.receive_loop():
+                received.append(cm)
+                break
+
+        await asyncio.wait_for(_collect(), timeout=5.0)
+
+        assert len(received) == 1
+        assert received[0].content == "after unknown"
+
+        await alice.close()
+        await bob.close()
+
+    async def test_unknown_type_logged(self, tmp_path: Path, caplog):
+        """Receiving an unknown message type is logged at DEBUG level."""
+        alice, bob, alice_acc, bob_acc = await self._setup(tmp_path)
+
+        unknown = WireMessage(
+            type="totally_made_up",
+            from_id=alice_acc.user_id,
+            to_id=bob_acc.user_id,
+            timestamp=int(time.time() * 1000),
+            message_id=str(uuid.uuid4()),
+            payload={},
+        )
+        await write_message(alice._writer, unknown)
+        # Sentinel message so the loop yields and we can break.
+        await alice.send_message("sentinel")
+
+        received: list[ChatMessage] = []
+
+        async def _collect():
+            async for cm in bob.receive_loop():
+                received.append(cm)
+                break
+
+        with caplog.at_level(logging.DEBUG, logger="p2pchat.core.network.session"):
+            await asyncio.wait_for(_collect(), timeout=5.0)
+
+        assert any(
+            "Unknown message type" in rec.message and "totally_made_up" in rec.message
+            for rec in caplog.records
+        )
+
+        await alice.close()
+        await bob.close()
+
+    async def test_session_continues_after_multiple_unknown_types(self, tmp_path: Path):
+        """Multiple unknown-type messages do not accumulate failures or disconnect."""
+        alice, bob, alice_acc, bob_acc = await self._setup(tmp_path)
+
+        # Send several unknown-type messages.
+        for i in range(10):
+            unknown = WireMessage(
+                type=f"unknown_type_{i}",
+                from_id=alice_acc.user_id,
+                to_id=bob_acc.user_id,
+                timestamp=int(time.time() * 1000),
+                message_id=str(uuid.uuid4()),
+                payload={},
+            )
+            await write_message(alice._writer, unknown)
+
+        # Follow with a valid chat message.
+        await alice.send_message("still alive after unknowns")
+
+        received: list[ChatMessage] = []
+
+        async def _collect():
+            async for cm in bob.receive_loop():
+                received.append(cm)
+                break
+
+        await asyncio.wait_for(_collect(), timeout=5.0)
+
+        assert len(received) == 1
+        assert received[0].content == "still alive after unknowns"
+        assert bob.state == "active"
+
+        await alice.close()
+        await bob.close()

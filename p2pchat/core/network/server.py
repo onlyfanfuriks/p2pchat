@@ -248,6 +248,8 @@ class ChatServer:
     ) -> None:
         """Wrap the connection in a PeerSession, handshake, then notify caller."""
         # N-03: Enforce connection limit.
+        # In single-threaded asyncio, locked() check + immediate async with
+        # in the same coroutine turn is safe — no preemption between them.
         if self._conn_semaphore.locked():
             log.warning("Connection limit reached; rejecting incoming connection")
             try:

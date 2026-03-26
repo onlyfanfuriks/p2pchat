@@ -14,7 +14,7 @@ from typing import Awaitable, Callable
 
 from textual import on
 from textual.app import ComposeResult
-from textual.containers import Horizontal
+from textual.containers import Container
 from textual.message import Message
 from textual.screen import Screen
 from textual.widgets import Footer
@@ -35,7 +35,8 @@ class ChatScreen(Screen):
     """Primary chat interface."""
 
     BINDINGS = [
-        ("ctrl+i", "show_invite", "My invite"),
+        ("f1", "help", "Help"),
+        ("ctrl+n", "show_invite", "My invite"),
         ("ctrl+o", "open_invite", "Connect"),
         ("ctrl+d", "delete_chat", "Delete chat"),
         ("ctrl+b", "backup", "Backup"),
@@ -60,10 +61,11 @@ class ChatScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield StatusBar(id="status-bar")
-        with Horizontal(id="main-pane"):
-            yield ContactList(id="contact-list")
-            yield MessageList(id="message-list", highlight=True, markup=True)
-        yield ChatInput(id="chat-input")
+        with Container(id="chat-body"):
+            with Container(id="chat-content"):
+                yield ContactList(id="contact-list", classes="section")
+                yield MessageList(id="message-list", highlight=True, markup=True, classes="section")
+            yield ChatInput(id="chat-input")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -171,6 +173,10 @@ class ChatScreen(Screen):
     # ------------------------------------------------------------------
     # Key binding actions
     # ------------------------------------------------------------------
+
+    def action_help(self) -> None:
+        from ..widgets.help_screen import HelpScreen
+        self.app.push_screen(HelpScreen("chat"))
 
     def action_show_invite(self) -> None:
         if not self._account.ygg_address:

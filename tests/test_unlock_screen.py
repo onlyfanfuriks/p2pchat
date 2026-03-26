@@ -1,7 +1,7 @@
 """Tests for the UnlockScreen — account selector, wizard, and password unlock.
 
 Tests the unlock flow, attempt limiting, wizard state machine,
-account selection, and input validation.
+account selection, input validation, and account deletion.
 """
 
 from pathlib import Path
@@ -10,7 +10,7 @@ from unittest.mock import patch, MagicMock
 from textual.app import App
 
 from p2pchat.core.account import Account, AccountInfo
-from p2pchat.ui.screens.unlock import UnlockScreen, _MAX_ATTEMPTS, _COOLDOWN_SECONDS
+from p2pchat.ui.screens.unlock import UnlockScreen, _MAX_ATTEMPTS, _COOLDOWN_SECONDS, _MODE_DELETE, _MODE_PASSWORD, _MODE_SELECT, _MODE_WIZARD
 
 
 # ---------------------------------------------------------------------------
@@ -368,3 +368,329 @@ class TestPasswordUnlock:
             screen = pilot.app.screen
             await screen.action_go_back()
             await pilot.pause()
+
+
+# ---------------------------------------------------------------------------
+# TestRichMarkupEscaping
+# ---------------------------------------------------------------------------
+
+class TestRichMarkupEscaping:
+    """Verify that display_name with Rich markup is escaped in compose output."""
+
+    async def _enter_password_mode(self, pilot, accounts):
+        screen = pilot.app.screen
+        screen._selected = accounts[0]
+        screen._mode = "password"
+        screen._attempts = 0
+        screen._locked_until = 0.0
+        await screen.recompose()
+        await pilot.pause()
+        return screen
+
+    async def _enter_delete_mode(self, pilot, accounts):
+        screen = await self._enter_password_mode(pilot, accounts)
+        screen._mode = "delete"
+        await screen.recompose()
+        await pilot.pause()
+        return screen
+
+    async def test_password_compose_escapes_rich_markup(self):
+        """Rich markup in display_name is escaped in the password prompt label."""
+        accounts = _fake_accounts(["[bold red]EVIL[/]"])
+        async with _make_unlock_app(accounts).run_test() as pilot:
+            await pilot.pause()
+            screen = await self._enter_password_mode(pilot, accounts)
+            labels = screen.query("Label")
+            label_texts = [str(lbl._Static__content) for lbl in labels]
+            combined = " ".join(label_texts)
+            # The raw markup tag should NOT appear unescaped (Rich would strip it).
+            # Instead the escaped form \\[ should be present, proving escape() was called.
+            assert "EVIL" in combined
+            # If [bold red] were NOT escaped, Rich would interpret it as formatting
+            # and it would not appear literally. Verify it appears as literal text.
+            assert "\\[bold red]" in combined or "\\[bold red\\]" in combined
+
+    async def test_delete_compose_escapes_rich_markup(self):
+        """Rich markup in display_name is escaped in the delete confirmation labels."""
+        accounts = _fake_accounts(["[bold red]EVIL[/]"])
+        async with _make_unlock_app(accounts).run_test() as pilot:
+            await pilot.pause()
+            screen = await self._enter_delete_mode(pilot, accounts)
+            labels = screen.query("Label")
+            label_texts = [str(lbl._Static__content) for lbl in labels]
+            combined = " ".join(label_texts)
+            assert "EVIL" in combined
+            assert "\\[bold red]" in combined or "\\[bold red\\]" in combined
+
+    async def test_password_compose_special_characters(self):
+        """Special characters in display_name don't break password compose."""
+        accounts = _fake_accounts(["[link=http://evil]click[/link]"])
+        async with _make_unlock_app(accounts).run_test() as pilot:
+            await pilot.pause()
+            screen = await self._enter_password_mode(pilot, accounts)
+            # Should not raise; password input must still be present.
+            assert screen.query("#password-input")
+
+    async def test_delete_compose_special_characters(self):
+        """Special characters in display_name don't break delete compose."""
+        accounts = _fake_accounts(["O'Brien & [team]"])
+        async with _make_unlock_app(accounts).run_test() as pilot:
+            await pilot.pause()
+            screen = await self._enter_delete_mode(pilot, accounts)
+            assert screen.query("#delete-input")
+
+
+# ---------------------------------------------------------------------------
+# TestDeleteAccountFlow
+# ---------------------------------------------------------------------------
+
+class TestDeleteAccountFlow:
+    """Tests for the action_delete_account confirmation and deletion flow."""
+
+    async def _enter_password_mode(self, pilot, accounts):
+        screen = pilot.app.screen
+        screen._selected = accounts[0]
+        screen._mode = _MODE_PASSWORD
+        screen._attempts = 0
+        screen._locked_until = 0.0
+        await screen.recompose()
+        await pilot.pause()
+        return screen
+
+    async def _enter_delete_mode(self, pilot, accounts):
+        screen = await self._enter_password_mode(pilot, accounts)
+        await screen.action_delete_account()
+        await pilot.pause()
+        return screen
+
+    async def test_delete_confirmation_correct_phrase(self):
+        """Typing the correct confirmation phrase triggers deletion."""
+        accounts = _fake_accounts(["Alice"])
+        async with _make_unlock_app(accounts).run_test() as pilot:
+            await pilot.pause()
+            screen = await self._enter_delete_mode(pilot, accounts)
+            assert screen._mode == _MODE_DELETE
+
+            from textual.widgets import Input
+            inp = screen.query_one("#delete-input", Input)
+            inp.focus()
+            inp.value = "delete account Alice"
+
+            with patch("p2pchat.core.network.session.uuid", create=True):
+                with patch("p2pchat.ui.screens.unlock.list_accounts", return_value=[]):
+                    with patch("p2pchat.core.secure_delete.secure_delete_dir") as mock_del:
+                        await inp.action_submit()
+                        await pilot.pause()
+                        await screen.workers.wait_for_complete()
+                        await pilot.pause()
+
+                        mock_del.assert_called_once_with(accounts[0].account_dir)
+
+    async def test_delete_wrong_phrase_shows_error(self):
+        """Typing a wrong confirmation phrase shows error and does not delete."""
+        accounts = _fake_accounts(["Alice"])
+        async with _make_unlock_app(accounts).run_test() as pilot:
+            await pilot.pause()
+            screen = await self._enter_delete_mode(pilot, accounts)
+
+            from textual.widgets import Input
+            inp = screen.query_one("#delete-input", Input)
+            inp.focus()
+            inp.value = "wrong phrase"
+            await inp.action_submit()
+            await pilot.pause()
+
+            err = screen.query_one("#error-label")
+            content = str(err._Static__content).lower()
+            assert "does not match" in content
+            # Should still be in delete mode.
+            assert screen._mode == _MODE_DELETE
+
+    async def test_delete_partial_phrase_rejected(self):
+        """Typing only part of the confirmation phrase is rejected."""
+        accounts = _fake_accounts(["Alice"])
+        async with _make_unlock_app(accounts).run_test() as pilot:
+            await pilot.pause()
+            screen = await self._enter_delete_mode(pilot, accounts)
+
+            from textual.widgets import Input
+            inp = screen.query_one("#delete-input", Input)
+            inp.focus()
+            inp.value = "delete account"  # missing name
+            await inp.action_submit()
+            await pilot.pause()
+
+            err = screen.query_one("#error-label")
+            content = str(err._Static__content).lower()
+            assert "does not match" in content
+
+    async def test_delete_removes_account_dir(self, tmp_path):
+        """Successful deletion calls secure_delete_dir with the account directory."""
+        base = tmp_path / "accounts"
+        base.mkdir()
+        accounts = _fake_accounts(["TestUser"], base=base)
+        # Create a fake account directory.
+        acct_dir = accounts[0].account_dir
+        acct_dir.mkdir(parents=True, exist_ok=True)
+        (acct_dir / "identity.key").write_text("fake key data")
+
+        async with _make_unlock_app(accounts).run_test() as pilot:
+            await pilot.pause()
+            screen = await self._enter_delete_mode(pilot, accounts)
+
+            from textual.widgets import Input
+            inp = screen.query_one("#delete-input", Input)
+            inp.focus()
+            inp.value = "delete account TestUser"
+
+            with patch("p2pchat.ui.screens.unlock.list_accounts", return_value=[]):
+                with patch("p2pchat.core.secure_delete.secure_delete_dir") as mock_del:
+                    await inp.action_submit()
+                    await pilot.pause()
+                    await screen.workers.wait_for_complete()
+                    await pilot.pause()
+
+                    mock_del.assert_called_once_with(acct_dir)
+
+    async def test_delete_calls_secure_delete(self):
+        """Successful deletion calls secure_delete_dir with the account dir."""
+        accounts = _fake_accounts(["Alice"])
+        acct_dir = accounts[0].account_dir
+        async with _make_unlock_app(accounts).run_test() as pilot:
+            await pilot.pause()
+            screen = await self._enter_delete_mode(pilot, accounts)
+
+            from textual.widgets import Input
+            inp = screen.query_one("#delete-input", Input)
+            inp.focus()
+            inp.value = "delete account Alice"
+
+            with patch("p2pchat.ui.screens.unlock.list_accounts", return_value=[]):
+                with patch(
+                    "p2pchat.core.secure_delete.secure_delete_dir"
+                ) as mock_del:
+                    await inp.action_submit()
+                    await pilot.pause()
+                    await screen.workers.wait_for_complete()
+                    await pilot.pause()
+                    mock_del.assert_called_once_with(acct_dir)
+
+    async def test_delete_returns_to_selector_after_success(self):
+        """After successful deletion, screen returns to selector or wizard."""
+        accounts = _fake_accounts(["Alice", "Bob"])
+        remaining = _fake_accounts(["Bob"])
+
+        async with _make_unlock_app(accounts).run_test() as pilot:
+            await pilot.pause()
+            screen = await self._enter_delete_mode(pilot, accounts)
+
+            from textual.widgets import Input
+            inp = screen.query_one("#delete-input", Input)
+            inp.focus()
+            inp.value = "delete account Alice"
+
+            with patch("p2pchat.ui.screens.unlock.list_accounts", return_value=remaining):
+                with patch("p2pchat.core.secure_delete.secure_delete_dir"):
+                    await inp.action_submit()
+                    await pilot.pause()
+                    await screen.workers.wait_for_complete()
+                    await pilot.pause()
+
+                    # With remaining accounts, should go to select mode.
+                    assert screen._mode == _MODE_SELECT
+
+    async def test_delete_returns_to_wizard_when_no_accounts_left(self):
+        """After deleting the last account, screen switches to wizard mode."""
+        accounts = _fake_accounts(["Alice"])
+
+        async with _make_unlock_app(accounts).run_test() as pilot:
+            await pilot.pause()
+            screen = await self._enter_delete_mode(pilot, accounts)
+
+            from textual.widgets import Input
+            inp = screen.query_one("#delete-input", Input)
+            inp.focus()
+            inp.value = "delete account Alice"
+
+            with patch("p2pchat.ui.screens.unlock.list_accounts", return_value=[]):
+                with patch("p2pchat.core.secure_delete.secure_delete_dir"):
+                    await inp.action_submit()
+                    await pilot.pause()
+                    await screen.workers.wait_for_complete()
+                    await pilot.pause()
+
+                    assert screen._mode == _MODE_WIZARD
+
+    async def test_action_delete_only_from_password_mode(self):
+        """action_delete_account does nothing unless in password mode."""
+        async with _make_unlock_app([]).run_test() as pilot:
+            await pilot.pause()
+            screen = pilot.app.screen
+            assert screen._mode == _MODE_WIZARD
+            await screen.action_delete_account()
+            await pilot.pause()
+            # Should still be in wizard mode.
+            assert screen._mode == _MODE_WIZARD
+
+    async def test_escape_from_delete_goes_back_to_password(self):
+        """Pressing escape in delete mode returns to password mode."""
+        accounts = _fake_accounts(["Alice"])
+        async with _make_unlock_app(accounts).run_test() as pilot:
+            await pilot.pause()
+            screen = await self._enter_delete_mode(pilot, accounts)
+            assert screen._mode == _MODE_DELETE
+            await screen.action_go_back()
+            await pilot.pause()
+            assert screen._mode == _MODE_PASSWORD
+
+    async def test_action_delete_shows_confirmation_input(self):
+        """action_delete_account transitions to delete mode and shows the delete input."""
+        accounts = _fake_accounts(["Alice"])
+        async with _make_unlock_app(accounts).run_test() as pilot:
+            await pilot.pause()
+            screen = await self._enter_password_mode(pilot, accounts)
+            assert screen._mode == _MODE_PASSWORD
+            await screen.action_delete_account()
+            await pilot.pause()
+            assert screen._mode == _MODE_DELETE
+            assert screen.query("#delete-input")
+
+    async def test_escape_from_delete_does_not_call_secure_delete(self):
+        """Canceling deletion via escape does NOT call secure_delete_dir."""
+        accounts = _fake_accounts(["Alice"])
+        async with _make_unlock_app(accounts).run_test() as pilot:
+            await pilot.pause()
+            screen = await self._enter_delete_mode(pilot, accounts)
+            assert screen._mode == _MODE_DELETE
+
+            with patch("p2pchat.core.secure_delete.secure_delete_dir") as mock_del:
+                await screen.action_go_back()
+                await pilot.pause()
+                mock_del.assert_not_called()
+
+            assert screen._mode == _MODE_PASSWORD
+            # Account should still be selected.
+            assert screen._selected is not None
+
+    async def test_wrong_confirmation_phrase_rejected(self):
+        """Typing a wrong confirmation phrase shows error, does not delete."""
+        accounts = _fake_accounts(["Alice"])
+        async with _make_unlock_app(accounts).run_test() as pilot:
+            await pilot.pause()
+            screen = await self._enter_delete_mode(pilot, accounts)
+
+            from textual.widgets import Input
+            inp = screen.query_one("#delete-input", Input)
+            inp.focus()
+            inp.value = "wrong phrase"
+
+            with patch(
+                "p2pchat.core.secure_delete.secure_delete_dir"
+            ) as mock_del:
+                await inp.action_submit()
+                await pilot.pause()
+                mock_del.assert_not_called()
+
+            err = screen.query_one("#error-label")
+            content = str(err._Static__content).lower()
+            assert "does not match" in content

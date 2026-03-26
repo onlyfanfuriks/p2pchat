@@ -54,23 +54,43 @@ class ContactList(OptionList):
 
     def increment_unread(self, peer_id: str) -> None:
         self._unread[peer_id] = self._unread.get(peer_id, 0) + 1
-        self._rebuild()
+        self._update_option_label(peer_id)
 
     def clear_unread(self, peer_id: str) -> None:
         self._unread.pop(peer_id, None)
         self._rebuild()
+
+    def _update_option_label(self, peer_id: str) -> None:
+        """Update a single option's label without rebuilding the whole list."""
+        contact = self._contacts.get(peer_id)
+        if contact is None:
+            return
+        # Find the index for this peer_id.
+        for i, (pid, _) in enumerate(self._contacts.items()):
+            if pid == peer_id:
+                online = pid in self._online
+                dot = "[green]\u25cf[/green]" if online else "[dim]\u25cb[/dim]"
+                name = escape(contact.display_name)
+                count = self._unread.get(pid, 0)
+                badge = f" [bold]\u2709 {count}[/bold]" if count > 0 else ""
+                label = f"{dot} {name}{badge}"
+                self.replace_option_prompt(pid, label)
+                return
 
     def _rebuild(self) -> None:
         """Reconstruct option items from current state."""
         self.clear_options()
         selected_index: int | None = None
         for i, (pid, contact) in enumerate(self._contacts.items()):
-            dot = "\u25cf" if pid in self._online else "\u25cb"
-            badge = ""
+            online = pid in self._online
+            dot = "[green]\u25cf[/green]" if online else "[dim]\u25cb[/dim]"
+            name = escape(contact.display_name)
             count = self._unread.get(pid, 0)
             if count > 0:
-                badge = f" [{count}]"
-            label = f"{dot} {escape(contact.display_name)}{badge}"
+                badge = f" [bold]\u2709 {count}[/bold]"
+            else:
+                badge = ""
+            label = f"{dot} {name}{badge}"
             self.add_option(Option(label, id=pid))
             if pid == self.selected_peer:
                 selected_index = i

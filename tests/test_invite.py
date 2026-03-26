@@ -125,12 +125,15 @@ class TestBuildInvite:
         assert info.ed25519_pub == pub_bytes
         assert info.display_name == "Bob"
 
-    def test_strips_hash_from_name(self, valid_keypair):
-        """Hash in display name is removed to prevent injection."""
+    def test_url_encodes_special_chars_in_name(self, valid_keypair):
+        """Special characters in display name are percent-encoded."""
         _, pub_b64 = valid_keypair
         link = build_invite("200:abcd::1", 7331, pub_b64, "Al#ice")
-        assert "#Alice" in link
-        assert "#Al#ice" not in link
+        assert "#Al%23ice" in link
+        # Round-trip preserves original name
+        info = parse_invite(link)
+        assert info is not None
+        assert info.display_name == "Al#ice"
 
     def test_empty_display_name(self, valid_keypair):
         _, pub_b64 = valid_keypair
@@ -143,6 +146,48 @@ class TestBuildInvite:
         link = build_invite("200:abcd::1", 7331, pub_b64, "Test")
         assert link.startswith("p2pchat://[200:abcd::1]:7331/")
         assert link.endswith("#Test")
+
+    def test_spaces_in_display_name_url_encoded(self, valid_keypair):
+        """Spaces in display name are percent-encoded in the link."""
+        _, pub_b64 = valid_keypair
+        link = build_invite("200:abcd::1", 7331, pub_b64, "Alice Smith")
+        # The fragment must contain %20, not a raw space.
+        fragment = link.split("#", 1)[1]
+        assert " " not in fragment
+        assert "%20" in fragment or "+" in fragment
+        # More specifically, quote(safe="") encodes spaces as %20.
+        assert "Alice%20Smith" in fragment
+
+    def test_url_encoded_display_name_roundtrip(self, valid_keypair):
+        """Names with spaces round-trip through build -> parse."""
+        _, pub_b64 = valid_keypair
+        names = ["Alice Smith", "  leading", "trailing  ", "a  b  c"]
+        for name in names:
+            link = build_invite("200:abcd::1", 7331, pub_b64, name)
+            info = parse_invite(link)
+            assert info.display_name == name, f"Failed round-trip for {name!r}"
+
+    def test_unicode_emoji_display_name(self, valid_keypair):
+        """Emoji display names round-trip correctly."""
+        _, pub_b64 = valid_keypair
+        link = build_invite("200:abcd::1", 7331, pub_b64, "\U0001f680 Rocket")
+        info = parse_invite(link)
+        assert info.display_name == "\U0001f680 Rocket"
+
+    def test_unicode_cjk_display_name(self, valid_keypair):
+        """CJK characters in display names round-trip correctly."""
+        _, pub_b64 = valid_keypair
+        link = build_invite("200:abcd::1", 7331, pub_b64, "\u5f20\u4f1f")
+        info = parse_invite(link)
+        assert info.display_name == "\u5f20\u4f1f"
+
+    def test_unicode_mixed_script_display_name(self, valid_keypair):
+        """Mixed-script names (Latin + CJK + emoji) survive encoding."""
+        _, pub_b64 = valid_keypair
+        name = "Alice \u5f20\u4f1f \U0001f44b"
+        link = build_invite("200:abcd::1", 7331, pub_b64, name)
+        info = parse_invite(link)
+        assert info.display_name == name
 
 
 # ---------------------------------------------------------------------------

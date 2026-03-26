@@ -65,6 +65,29 @@ class TestAccountKeyDerivation:
         key2 = derive_account_key("password", os.urandom(32))
         assert key1 != key2
 
+    def test_nfc_precomposed_and_decomposed_produce_same_key(self):
+        """'\u00e9' (precomposed) and 'e\u0301' (e + combining accent) must derive the same key."""
+        salt = os.urandom(32)
+        precomposed = "\u00e9"          # NFC form
+        decomposed = "e\u0301"          # NFD form
+        assert precomposed != decomposed  # sanity: distinct codepoint sequences
+        key1 = derive_account_key(precomposed, salt)
+        key2 = derive_account_key(decomposed, salt)
+        assert key1 == key2
+
+    def test_combining_characters_normalized_before_kdf(self):
+        """Passwords with combining characters are NFC-normalized so the same
+        visual string always produces the same derived key regardless of how
+        the input was composed."""
+        salt = os.urandom(32)
+        # U+00F1 (n-tilde precomposed) vs U+006E U+0303 (n + combining tilde)
+        precomposed = "se\u00f1or"
+        decomposed = "sen\u0303or"
+        assert precomposed != decomposed
+        key1 = derive_account_key(precomposed, salt)
+        key2 = derive_account_key(decomposed, salt)
+        assert key1 == key2
+
 
 class TestEncryptDecrypt:
     def test_round_trip(self):

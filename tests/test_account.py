@@ -198,6 +198,72 @@ class TestAccountLoad:
         assert loaded.created_at == original_ts
 
 
+class TestAccountTamperedFile:
+    """Loading an account file that has been tampered with or truncated."""
+
+    def test_tampered_salt_raises(self, tmp_account):
+        """Changing the salt produces a different derived key, so decryption
+        must fail with InvalidTag (GCM authentication failure)."""
+        original = Account.create("pw", "Alice")
+        acct_file = _account_file(original)
+        data = json.loads(acct_file.read_text())
+
+        import base64
+        real_salt = base64.urlsafe_b64decode(data["salt"] + "=" * (-len(data["salt"]) % 4))
+        fake_salt = bytes([b ^ 0xFF for b in real_salt])
+        data["salt"] = base64.urlsafe_b64encode(fake_salt).decode().rstrip("=")
+        acct_file.write_text(json.dumps(data))
+
+        with pytest.raises(InvalidTag):
+            Account.load("pw", original.account_dir)
+
+    def test_tampered_ciphertext_raises(self, tmp_account):
+        """Flipping a byte in the encrypted private key blob must fail
+        GCM authentication (InvalidTag)."""
+        original = Account.create("pw", "Alice")
+        acct_file = _account_file(original)
+        data = json.loads(acct_file.read_text())
+
+        import base64
+        raw = base64.urlsafe_b64decode(data["ed25519_private"] + "=" * (-len(data["ed25519_private"]) % 4))
+        tampered = raw[:12] + bytes([raw[12] ^ 0xFF]) + raw[13:]
+        data["ed25519_private"] = base64.urlsafe_b64encode(tampered).decode().rstrip("=")
+        acct_file.write_text(json.dumps(data))
+
+        with pytest.raises(InvalidTag):
+            Account.load("pw", original.account_dir)
+
+    def test_truncated_file_raises_value_error(self, tmp_account):
+        """A file truncated mid-JSON must be handled gracefully as ValueError."""
+        acct_dir = tmp_account / "accounts" / "truncated"
+        acct_dir.mkdir(parents=True)
+        (acct_dir / acc_module._ACCOUNT_FILENAME).write_text('{"version": 1, "salt":', encoding="utf-8")
+
+        with pytest.raises(ValueError, match="corrupt"):
+            Account.load("pw", acct_dir)
+
+    def test_missing_encrypted_field_raises_value_error(self, tmp_account):
+        """An account file with a missing encrypted field must raise ValueError."""
+        original = Account.create("pw", "Alice")
+        acct_file = _account_file(original)
+        data = json.loads(acct_file.read_text())
+
+        del data["ed25519_private"]
+        acct_file.write_text(json.dumps(data))
+
+        with pytest.raises((ValueError, InvalidTag)):
+            Account.load("pw", original.account_dir)
+
+    def test_empty_file_raises_value_error(self, tmp_account):
+        """A completely empty file must raise ValueError (invalid JSON)."""
+        acct_dir = tmp_account / "accounts" / "empty"
+        acct_dir.mkdir(parents=True)
+        (acct_dir / acc_module._ACCOUNT_FILENAME).write_text("", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="corrupt"):
+            Account.load("pw", acct_dir)
+
+
 class TestAccountSave:
     def test_save_updates_content(self, tmp_account):
         account = Account.create("pw", "Alice")
@@ -251,6 +317,95 @@ class TestAccountRepr:
         r = repr(account)
         assert "ed25519_private" not in r
         assert "x25519_private" not in r
+
+
+class TestMigrateLegacyAccount:
+    """Tests for migrate_legacy_account — moving old single-account layout."""
+
+    def test_successful_migration_moves_files(self, tmp_account):
+        """A legacy account.json (+ siblings) should be moved into accounts/<name>/."""
+        from p2pchat.core.account import migrate_legacy_account
+
+        # Create a real account in the old flat layout.
+        account = Account.create("pw", "Alice")
+        acct_file = _account_file(account)
+        data = json.loads(acct_file.read_text())
+
+        # Simulate the legacy layout: move account.json to the top-level dir.
+        legacy_file = tmp_account / "account.json"
+        legacy_file.write_text(json.dumps(data), encoding="utf-8")
+        # Add a sibling file that should also be migrated.
+        (tmp_account / "messages.db").write_bytes(b"fake-db")
+
+        # Remove the new-layout directory contents so migration is triggered.
+        import shutil
+        shutil.rmtree(acc_module.ACCOUNTS_DIR)
+        acc_module.ACCOUNTS_DIR.mkdir()
+
+        migrate_legacy_account()
+
+        # The legacy file should no longer exist at the old location.
+        assert not legacy_file.exists()
+        assert not (tmp_account / "messages.db").exists()
+
+        # Files should now be under accounts/<name>/.
+        dest = acc_module.ACCOUNTS_DIR / "Alice"
+        assert (dest / "account.json").exists()
+        assert (dest / "messages.db").exists()
+
+    def test_noop_when_no_legacy_account(self, tmp_account):
+        """When no legacy account.json exists, migration does nothing."""
+        from p2pchat.core.account import migrate_legacy_account
+
+        legacy_file = tmp_account / "account.json"
+        assert not legacy_file.exists()
+
+        migrate_legacy_account()
+
+        # accounts dir should still be empty (no crash, no new dirs).
+        assert list(acc_module.ACCOUNTS_DIR.iterdir()) == []
+
+    def test_noop_when_already_migrated(self, tmp_account):
+        """If accounts/ already has content, migration is skipped even if legacy file exists."""
+        from p2pchat.core.account import migrate_legacy_account
+
+        # Create a proper account under accounts/ first.
+        Account.create("pw", "Bob")
+
+        # Also create a legacy file (should be ignored).
+        legacy_file = tmp_account / "account.json"
+        legacy_file.write_text('{"display_name_plain": "Old"}', encoding="utf-8")
+
+        migrate_legacy_account()
+
+        # Legacy file should still be there (not consumed) since migration was skipped.
+        assert legacy_file.exists()
+
+    def test_corrupted_legacy_file_uses_default_name(self, tmp_account):
+        """If legacy account.json is corrupt, migration uses 'default' as dir name."""
+        from p2pchat.core.account import migrate_legacy_account
+
+        legacy_file = tmp_account / "account.json"
+        legacy_file.write_text("not valid json at all{{{", encoding="utf-8")
+
+        # Also add a sibling to verify it gets moved.
+        (tmp_account / "messages.db").write_bytes(b"fake-db")
+
+        # Clear accounts dir so migration runs.
+        import shutil
+        shutil.rmtree(acc_module.ACCOUNTS_DIR)
+        acc_module.ACCOUNTS_DIR.mkdir()
+
+        migrate_legacy_account()
+
+        # Should have used "default" as the directory name.
+        dest = acc_module.ACCOUNTS_DIR / "default"
+        assert dest.is_dir()
+        assert (dest / "account.json").exists()
+        assert (dest / "messages.db").exists()
+        # Original locations should be gone.
+        assert not legacy_file.exists()
+        assert not (tmp_account / "messages.db").exists()
 
 
 class TestListAccounts:

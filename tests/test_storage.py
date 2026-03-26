@@ -3,6 +3,7 @@
 import asyncio
 import os
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -12,6 +13,7 @@ from p2pchat.core.storage import (
     Message,
     OutboxItem,
     Storage,
+    _run_migrations,
     _secure_delete,
     derive_db_key,
 )
@@ -208,6 +210,174 @@ class TestMigrations:
         await storage.delete_contact("peer1")
         msgs = await storage.get_messages("peer1", include_deleted=True)
         assert msgs == []
+
+
+# ---------------------------------------------------------------------------
+# Schema migration failure / rollback
+# ---------------------------------------------------------------------------
+
+
+class TestSchemaMigrationEdgeCases:
+    async def test_migration_from_older_schema_succeeds(self, tmp_path):
+        """Re-opening a DB that already has v1 applied still works (no-op migration)."""
+        key = make_db_key()
+        db = tmp_path / "messages.db"
+
+        s1 = Storage(db, key)
+        await s1.initialize()
+        await s1.upsert_account("uid", "Alice", 1000)
+        await s1.close()
+
+        # Re-open: migrations runner sees v1 already applied, skips it.
+        s2 = Storage(db, key)
+        await s2.initialize()
+        assert await s2.get_schema_version() == 1
+        assert await s2.get_account() == ("uid", "Alice", 1000)
+        await s2.close()
+
+    async def test_future_schema_version_in_tracking_table(self, tmp_path):
+        """If schema_migrations contains a future version, opening still works
+        (the runner only applies unapplied migrations; it does not reject
+        unknown versions). But if the actual tables are missing, queries fail."""
+        import sqlcipher3 as _sql
+
+        key = make_db_key()
+        db = tmp_path / "messages.db"
+
+        # Bootstrap normally first so the DB is keyed and tables exist.
+        s = Storage(db, key)
+        await s.initialize()
+        await s.close()
+
+        # Manually insert a future migration version into the tracking table.
+        conn = _sql.connect(str(db))
+        conn.execute(f"PRAGMA key=\"x'{key.hex()}'\"")
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (9999, ?)",
+            (int(time.time()),),
+        )
+        conn.commit()
+        conn.close()
+
+        # Re-open: should still work — runner sees v1 and v9999 as applied.
+        s2 = Storage(db, key)
+        await s2.initialize()
+        ver = await s2.get_schema_version()
+        assert ver == 9999  # MAX(version) reflects the injected row
+        await s2.close()
+
+    async def test_migration_failure_rolls_back(self, tmp_path):
+        """If a migration file contains bad SQL, the entire transaction is
+        rolled back and the database is not corrupted."""
+        import importlib.resources
+        import sqlcipher3 as _sql
+        from pathlib import Path as StdPath
+        from types import SimpleNamespace
+
+        key = make_db_key()
+        db = tmp_path / "messages.db"
+
+        # Pre-create the DB file with correct permissions and key it.
+        db.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(str(db), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+
+        conn = _sql.connect(str(db), check_same_thread=False)
+        conn.execute(f"PRAGMA key=\"x'{key.hex()}'\"")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+
+        # Apply the real migration first (so we have a valid v1 schema).
+        _run_migrations(conn)
+
+        # Insert some data to verify rollback preserves it.
+        conn.execute(
+            "INSERT INTO account (id, user_id, display_name, created_at) "
+            "VALUES (1, 'uid', 'Alice', 1000)"
+        )
+        conn.commit()
+
+        # Now create a fake broken migration file (v2) that will fail.
+        bad_migration = SimpleNamespace(
+            name="0002_broken.sql",
+            read_text=lambda encoding="utf-8": "CREATE TABLE broken_table (id INTEGER);\nINVALID SQL STATEMENT HERE;",
+        )
+
+        # The real migration (v1) plus the broken one.
+        real_migrations = list(__import__("p2pchat.core.storage", fromlist=["_iter_migration_paths"])._iter_migration_paths())
+        fake_migrations = real_migrations + [bad_migration]
+
+        with patch("p2pchat.core.storage._iter_migration_paths", return_value=fake_migrations):
+            with pytest.raises(Exception):
+                _run_migrations(conn)
+
+        # The rollback should have prevented the broken_table from being created.
+        tables = {
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert "broken_table" not in tables
+
+        # Original data must still be intact.
+        row = conn.execute(
+            "SELECT user_id, display_name FROM account WHERE id = 1"
+        ).fetchone()
+        assert row == ("uid", "Alice")
+
+        # Schema_migrations should only have v1 (v2 was rolled back).
+        applied = {
+            r[0]
+            for r in conn.execute("SELECT version FROM schema_migrations").fetchall()
+        }
+        assert 2 not in applied
+        assert 1 in applied
+
+        conn.close()
+
+    async def test_migration_rollback_preserves_existing_data(self, tmp_path):
+        """A failed migration must not corrupt pre-existing contacts/messages."""
+        import sqlcipher3 as _sql
+        from types import SimpleNamespace
+
+        key = make_db_key()
+        db = tmp_path / "messages.db"
+
+        # Bootstrap a fresh DB with data.
+        s = Storage(db, key)
+        await s.initialize()
+        await s.upsert_contact(_contact())
+        await s.save_message(_message())
+        await s.close()
+
+        # Open raw connection and try a broken migration.
+        conn = _sql.connect(str(db), check_same_thread=False)
+        conn.execute(f"PRAGMA key=\"x'{key.hex()}'\"")
+        conn.execute("PRAGMA foreign_keys=ON")
+
+        bad_migration = SimpleNamespace(
+            name="0002_bad.sql",
+            read_text=lambda encoding="utf-8": "ALTER TABLE contacts ADD COLUMN foo TEXT;\nBOGUS STATEMENT;",
+        )
+        real_migrations = list(__import__("p2pchat.core.storage", fromlist=["_iter_migration_paths"])._iter_migration_paths())
+        fake_migrations = real_migrations + [bad_migration]
+
+        with patch("p2pchat.core.storage._iter_migration_paths", return_value=fake_migrations):
+            with pytest.raises(Exception):
+                _run_migrations(conn)
+        conn.close()
+
+        # Re-open normally — data must still be intact.
+        s2 = Storage(db, key)
+        await s2.initialize()
+        contact = await s2.get_contact("peer1")
+        assert contact is not None
+        assert contact.display_name == "Alice"
+        msgs = await s2.get_messages("peer1")
+        assert len(msgs) == 1
+        assert msgs[0].content == "hello"
+        await s2.close()
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +609,86 @@ class TestMessages:
         await storage_with_contact.save_message(msg)
         result = await storage_with_contact.save_message(msg)
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# mark_all_delivered
+# ---------------------------------------------------------------------------
+
+
+class TestMarkAllDelivered:
+    async def test_marks_multiple_pending_messages(self, storage_with_contact):
+        """All undelivered sent messages for a peer should be marked delivered."""
+        for i in range(5):
+            await storage_with_contact.save_message(
+                _message(timestamp=1_000_000_000 + i, delivered=False)
+            )
+        count = await storage_with_contact.mark_all_delivered("peer1")
+        assert count == 5
+        msgs = await storage_with_contact.get_messages("peer1")
+        assert all(m.delivered is True for m in msgs)
+
+    async def test_noop_when_no_pending_messages(self, storage_with_contact):
+        """Returns 0 when there are no undelivered messages."""
+        # No messages at all.
+        count = await storage_with_contact.mark_all_delivered("peer1")
+        assert count == 0
+
+    async def test_noop_when_already_delivered(self, storage_with_contact):
+        """Already-delivered messages are not counted again."""
+        await storage_with_contact.save_message(
+            _message(timestamp=1_000_000_000, delivered=True)
+        )
+        count = await storage_with_contact.mark_all_delivered("peer1")
+        assert count == 0
+
+    async def test_only_affects_specified_peer(self, storage):
+        """Messages for a different peer must not be touched."""
+        await storage.upsert_contact(_contact("p1", display_name="Alice"))
+        await storage.upsert_contact(_contact("p2", display_name="Bob"))
+
+        await storage.save_message(_message("p1", timestamp=1_000_000_001, delivered=False))
+        await storage.save_message(_message("p2", timestamp=1_000_000_002, delivered=False))
+
+        count = await storage.mark_all_delivered("p1")
+        assert count == 1
+
+        # p2's message must still be undelivered.
+        p2_msgs = await storage.get_messages("p2")
+        assert len(p2_msgs) == 1
+        assert p2_msgs[0].delivered is False
+
+    async def test_does_not_affect_received_messages(self, storage_with_contact):
+        """Only 'sent' direction messages are affected, not 'received'."""
+        await storage_with_contact.save_message(
+            _message(direction="received", timestamp=1_000_000_001, delivered=False)
+        )
+        await storage_with_contact.save_message(
+            _message(direction="sent", timestamp=1_000_000_002, delivered=False)
+        )
+        count = await storage_with_contact.mark_all_delivered("peer1")
+        assert count == 1
+
+        msgs = await storage_with_contact.get_messages("peer1")
+        sent = [m for m in msgs if m.direction == "sent"]
+        received = [m for m in msgs if m.direction == "received"]
+        assert sent[0].delivered is True
+        assert received[0].delivered is False
+
+    async def test_does_not_affect_deleted_messages(self, storage_with_contact):
+        """Soft-deleted messages should not be marked delivered."""
+        await storage_with_contact.save_message(
+            _message(timestamp=1_000_000_001, delivered=False)
+        )
+        await storage_with_contact.delete_conversation("peer1")
+
+        # Add a new non-deleted message after the soft-delete.
+        await storage_with_contact.save_message(
+            _message(timestamp=1_000_000_002, delivered=False)
+        )
+
+        count = await storage_with_contact.mark_all_delivered("peer1")
+        assert count == 1  # only the non-deleted one
 
 
 # ---------------------------------------------------------------------------

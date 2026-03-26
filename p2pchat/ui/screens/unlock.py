@@ -10,6 +10,7 @@ On startup this is the first screen the user sees:
 from __future__ import annotations
 
 
+from rich.markup import escape
 from textual import on, work
 from textual.app import ComposeResult
 from textual.containers import Center, Vertical
@@ -44,6 +45,7 @@ class UnlockScreen(Screen):
             super().__init__()
 
     BINDINGS = [
+        Binding("f1", "help", "Help"),
         Binding("escape", "go_back", "Back"),
         Binding("ctrl+n", "new_account", "New account"),
         Binding("f8", "delete_account", "Delete account"),
@@ -96,7 +98,7 @@ class UnlockScreen(Screen):
         yield OptionList(*opts, id="account-list")
 
     def _compose_password(self) -> ComposeResult:
-        name = self._selected.display_name if self._selected else ""
+        name = escape(self._selected.display_name) if self._selected else ""
         yield Label(f"Unlock account [bold]{name}[/bold]:")
         yield Input(placeholder="Password", password=True, id="password-input")
 
@@ -105,7 +107,7 @@ class UnlockScreen(Screen):
         yield Input(placeholder="Display name", id="wizard-input")
 
     def _compose_delete(self) -> ComposeResult:
-        name = self._selected.display_name if self._selected else ""
+        name = escape(self._selected.display_name) if self._selected else ""
         yield Label(
             f"[red bold]Delete account \"{name}\" and all its data?[/red bold]"
         )
@@ -313,6 +315,10 @@ class UnlockScreen(Screen):
     # ------------------------------------------------------------------
     # Account deletion with confirmation
     # ------------------------------------------------------------------
+
+    def action_help(self) -> None:
+        from ..widgets.help_screen import HelpScreen
+        self.app.push_screen(HelpScreen("unlock"))
 
     async def action_delete_account(self) -> None:
         """Enter delete-confirmation mode for the selected account."""
